@@ -104,12 +104,18 @@ body {
   margin-top: 20px;
 }
 
-.laps-section h3 {
+.laps-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+.laps-header h3 {
   font-size: 1.3rem;
   color: #1e293b;
-  margin-bottom: 20px;
   font-weight: 600;
-  text-align: center;
+  margin: 0;
 }
 
 .laps-list {
@@ -130,6 +136,24 @@ body {
   border-radius: 8px;
   border: 1px solid #e2e8f0;
   transition: all 0.2s ease;
+}
+
+.lap-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex: 1;
+  gap: 10px;
+}
+
+.lap-info > * {
+  flex-shrink: 0;
+}
+
+.lap-details {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .lap-item:last-child {
@@ -214,6 +238,34 @@ body {
 .btn-secondary:hover:not(:disabled) {
   transform: translateY(-2px);
   box-shadow: 0 6px 20px rgba(239, 68, 68, 0.4);
+}
+
+.btn-lap {
+  background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+  color: white;
+  box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);
+}
+
+.btn-lap:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(16, 185, 129, 0.4);
+}
+
+.btn-stop {
+  background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+  color: white;
+  box-shadow: 0 4px 15px rgba(245, 158, 11, 0.3);
+}
+
+.btn-stop:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(245, 158, 11, 0.4);
+}
+
+.btn-small {
+  padding: 8px 16px;
+  font-size: 0.9rem;
+  min-width: auto;
 }
 
 .btn:disabled {
