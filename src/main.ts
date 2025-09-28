@@ -126,9 +126,12 @@ class ScreenTimeTracker {
 
   private async stopLap(): Promise<void> {
     try {
-      await invoke('stop_lap');
-      this.showNotification('Lap stopped!', 'success');
+      const result = await invoke<string>('stop_lap');
+      this.showNotification(result, 'success');
       await this.loadCurrentStatus();
+
+      // Session is paused, not ended - just update button states
+      this.updateButtonStates();
     } catch (error) {
       this.showNotification(`Failed to stop lap: ${error}`, 'error');
     }
@@ -142,15 +145,19 @@ class ScreenTimeTracker {
   private async loadCurrentStatus(): Promise<void> {
     try {
       this.currentStatus = await invoke<CurrentStatus | null>('get_current_status');
-      console.log('Current status:', this.currentStatus);
+
+      // Update isTracking state based on backend response
+      this.isTracking = this.currentStatus && this.currentStatus.is_active;
+
+
+      // Update button states when session state changes
+      this.updateButtonStates();
       this.updateTimerDisplay();
 
-      // If there's an active session, also load the laps
-      if (this.currentStatus && this.currentStatus.is_active) {
-        console.log('Active session detected, loading laps...');
+      // Load laps for both active and paused sessions
+      if (this.currentStatus) {
         await this.loadCurrentDayLaps();
       } else {
-        console.log('No active session, hiding laps section');
         this.hideLapsSection();
       }
     } catch (error) {
@@ -164,7 +171,8 @@ class ScreenTimeTracker {
     const sessionInfo = document.getElementById('session-info');
     const totalInfo = document.getElementById('total-info');
 
-    if (this.currentStatus) {
+    // Only show dynamic timers if there's an active session
+    if (this.currentStatus && this.currentStatus.is_active) {
       if (currentTimer) {
         currentTimer.textContent = this.formatTime(this.currentStatus.current_lap_duration);
       }
@@ -178,10 +186,30 @@ class ScreenTimeTracker {
         totalInfo.textContent = `Total from all laps`;
       }
     } else {
+      // Show static timers when no active session or paused
       if (currentTimer) currentTimer.textContent = '00:00:00';
-      if (totalTimer) totalTimer.textContent = '00:00:00';
-      if (sessionInfo) sessionInfo.textContent = 'No active session';
-      if (totalInfo) totalInfo.textContent = '0 laps completed';
+      if (totalTimer) {
+        // If we have a paused session, show the completed laps total
+        if (this.currentStatus && !this.currentStatus.is_active) {
+          totalTimer.textContent = this.formatTime(this.currentStatus.total_session_duration);
+        } else {
+          totalTimer.textContent = '00:00:00';
+        }
+      }
+      if (sessionInfo) {
+        if (this.currentStatus && !this.currentStatus.is_active) {
+          sessionInfo.textContent = `Paused session for ${this.currentStatus.day_key}`;
+        } else {
+          sessionInfo.textContent = 'No active session';
+        }
+      }
+      if (totalInfo) {
+        if (this.currentStatus && !this.currentStatus.is_active) {
+          totalInfo.textContent = `Completed laps only`;
+        } else {
+          totalInfo.textContent = '0 laps completed';
+        }
+      }
     }
   }
 
@@ -198,10 +226,17 @@ class ScreenTimeTracker {
     const addLapBtn = document.getElementById('add-lap-btn') as HTMLButtonElement;
 
     if (this.isTracking) {
+      // Active session
+      startBtn.disabled = true;
+      endBtn.disabled = false;
+      addLapBtn.disabled = false;
+    } else if (this.currentStatus && !this.currentStatus.is_active) {
+      // Paused session - can add new lap or end day
       startBtn.disabled = true;
       endBtn.disabled = false;
       addLapBtn.disabled = false;
     } else {
+      // No session
       startBtn.disabled = false;
       endBtn.disabled = true;
       addLapBtn.disabled = true;
@@ -210,9 +245,8 @@ class ScreenTimeTracker {
 
   private startStatusUpdates(): void {
     window.setInterval(async () => {
-      if (this.isTracking) {
-        await this.loadCurrentStatus();
-      }
+      // Always check the backend status to stay in sync
+      await this.loadCurrentStatus();
     }, 1000);
   }
 
@@ -220,7 +254,6 @@ class ScreenTimeTracker {
   private async loadCurrentDayLaps(): Promise<void> {
     try {
       const laps = await invoke<Lap[]>('get_current_day_laps');
-      console.log('Loaded laps from backend:', laps);
       this.displayLaps(laps);
       this.showLapsSection();
     } catch (error) {
@@ -232,8 +265,6 @@ class ScreenTimeTracker {
     const lapsList = document.getElementById('laps-list');
     if (!lapsList) return;
 
-    console.log('Displaying laps:', laps);
-
     if (laps.length === 0) {
       lapsList.innerHTML = '<div class="empty-laps">No laps recorded yet</div>';
       return;
@@ -241,9 +272,6 @@ class ScreenTimeTracker {
 
     const completedLaps = laps.filter(lap => lap.duration !== undefined && lap.duration !== null && lap.duration > 0);
     const currentLap = laps.find(lap => lap.duration === undefined || lap.duration === null);
-
-    console.log('Completed laps:', completedLaps);
-    console.log('Current lap:', currentLap);
 
     let lapsHtml = '';
 
@@ -291,10 +319,8 @@ class ScreenTimeTracker {
 
   private showLapsSection(): void {
     const lapsSection = document.getElementById('laps-section');
-    console.log('Showing laps section, element found:', !!lapsSection);
     if (lapsSection) {
       lapsSection.style.display = 'block';
-      console.log('Laps section display set to block');
     }
   }
 

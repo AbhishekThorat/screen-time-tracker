@@ -30,6 +30,7 @@ pub struct CurrentSession {
     pub start_time: Instant,
     pub day_key: String,
     pub current_lap_start: Instant,
+    pub is_paused: bool,
 }
 
 impl AppState {
@@ -60,6 +61,7 @@ async fn start_day(state: State<'_, AppState>) -> Result<String, String> {
         start_time: now,
         day_key: today.clone(),
         current_lap_start: now,
+        is_paused: false,
     };
     
     *session_guard = Some(session);
@@ -167,22 +169,36 @@ async fn get_current_status(state: State<'_, AppState>) -> Result<Option<Current
     let records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
     
     if let Some(session) = session_guard.as_ref() {
-        let current_lap_elapsed = session.current_lap_start.elapsed();
-        
-        // Calculate total duration from completed laps
+        // Calculate total duration from completed laps only
         let mut total_duration = 0u64;
         if let Some(day_record) = records_guard.get(&session.day_key) {
+            // Sum all completed laps
             total_duration = day_record.laps.iter()
                 .filter_map(|lap| lap.duration)
                 .sum();
         }
         
-        Ok(Some(CurrentStatus {
-            day_key: session.day_key.clone(),
-            current_lap_duration: current_lap_elapsed.as_secs(),
-            total_session_duration: total_duration,
-            is_active: true,
-        }))
+                if session.is_paused {
+                    // Session is paused - show only completed laps, no current lap time
+                    Ok(Some(CurrentStatus {
+                        day_key: session.day_key.clone(),
+                        current_lap_duration: 0, // No current lap when paused
+                        total_session_duration: total_duration, // Only completed laps
+                        is_active: false, // Not actively tracking
+                    }))
+                } else {
+            // Session is active - include current lap time
+            let current_lap_elapsed = session.current_lap_start.elapsed();
+            let current_lap_seconds = current_lap_elapsed.as_secs();
+            let total_with_current_lap = total_duration + current_lap_seconds;
+            
+            Ok(Some(CurrentStatus {
+                day_key: session.day_key.clone(),
+                current_lap_duration: current_lap_seconds,
+                total_session_duration: total_with_current_lap,
+                is_active: true,
+            }))
+        }
     } else {
         Ok(None)
     }
@@ -204,18 +220,11 @@ async fn get_current_day_laps(state: State<'_, AppState>) -> Result<Vec<Lap>, St
     
     if let Some(session) = session_guard.as_ref() {
         if let Some(day_record) = records_guard.get(&session.day_key) {
-            println!("Returning {} laps for day {}", day_record.laps.len(), session.day_key);
-            for (i, lap) in day_record.laps.iter().enumerate() {
-                println!("Lap {}: start_time={}, end_time={:?}, duration={:?}", 
-                    i, lap.start_time, lap.end_time, lap.duration);
-            }
             Ok(day_record.laps.clone())
         } else {
-            println!("No day record found for {}", session.day_key);
             Ok(Vec::new())
         }
     } else {
-        println!("No active session");
         Ok(Vec::new())
     }
 }
@@ -246,10 +255,10 @@ async fn add_lap(state: State<'_, AppState>) -> Result<String, String> {
             });
         }
         
-        // Reset current lap start time
+        // Reset current lap start time and resume session
         session.current_lap_start = Instant::now();
-        
-        Ok("New lap added successfully".to_string())
+        session.is_paused = false; // Resume the session
+        Ok("New lap added successfully - session resumed".to_string())
     } else {
         Err("No active session".to_string())
     }
@@ -272,10 +281,11 @@ async fn stop_lap(state: State<'_, AppState>) -> Result<String, String> {
             }
         }
         
-        // Reset current lap start time (for when user resumes)
-        session.current_lap_start = Instant::now();
+        // Mark session as paused (not ended)
+        session.is_paused = true;
+        session.current_lap_start = Instant::now(); // Reset for potential resume
         
-        Ok("Lap stopped successfully".to_string())
+        Ok("Lap stopped - session paused".to_string())
     } else {
         Err("No active session".to_string())
     }
