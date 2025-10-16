@@ -2,8 +2,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tauri::State;
+use tauri::{State, AppHandle, Manager};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
+use std::fs;
+use std::path::PathBuf;
+
+// macOS-specific imports removed since we're not using system notifications anymore
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lap {
@@ -26,10 +32,15 @@ pub struct AppState {
     pub day_records: Arc<Mutex<HashMap<String, DayRecord>>>,
 }
 
+pub type AppStateArc = Arc<AppState>;
+
 pub struct CurrentSession {
     pub start_time: Instant,
     pub day_key: String,
     pub current_lap_start: Instant,
+    pub current_lap_start_timestamp: u64, // SystemTime timestamp for accurate tracking
+    pub accumulated_seconds: u64, // Accumulated seconds for current lap
+    pub last_activity_time: Instant, // To detect sleep/hibernate gaps
     pub is_paused: bool,
 }
 
@@ -42,8 +53,123 @@ impl AppState {
     }
 }
 
+// Serializable version of session state for persistence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedSessionState {
+    day_key: String,
+    current_lap_start_timestamp: u64,
+    accumulated_seconds: u64,
+    is_paused: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedState {
+    current_session: Option<PersistedSessionState>,
+    day_records: HashMap<String, DayRecord>,
+}
+
+// Get the path to the state file
+fn get_state_file_path(app_handle: &AppHandle) -> PathBuf {
+    let app_data_dir = app_handle.path().app_data_dir().unwrap();
+    fs::create_dir_all(&app_data_dir).ok();
+    app_data_dir.join("state.json")
+}
+
+// Save state to disk
+fn save_state(app_handle: &AppHandle, state: &AppStateArc) {
+    let session_guard = state.current_session.lock().unwrap();
+    let records_guard = state.day_records.lock().unwrap();
+    
+    let persisted_session = session_guard.as_ref().map(|session| {
+        PersistedSessionState {
+            day_key: session.day_key.clone(),
+            current_lap_start_timestamp: session.current_lap_start_timestamp,
+            accumulated_seconds: session.accumulated_seconds,
+            is_paused: session.is_paused,
+        }
+    });
+    
+    let persisted_state = PersistedState {
+        current_session: persisted_session,
+        day_records: records_guard.clone(),
+    };
+    
+    let state_file = get_state_file_path(app_handle);
+    if let Ok(json) = serde_json::to_string_pretty(&persisted_state) {
+        fs::write(state_file, json).ok();
+        println!("✅ State saved successfully");
+    }
+}
+
+// Load state from disk
+fn load_state(app_handle: &AppHandle, state: &AppStateArc) {
+    let state_file = get_state_file_path(app_handle);
+    
+    if let Ok(json) = fs::read_to_string(&state_file) {
+        if let Ok(persisted_state) = serde_json::from_str::<PersistedState>(&json) {
+            // Restore day records
+            let mut records_guard = state.day_records.lock().unwrap();
+            *records_guard = persisted_state.day_records;
+            
+            // Restore session if it exists
+            if let Some(persisted_session) = persisted_state.current_session {
+                let now = Instant::now();
+                let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                
+                // Check if the session is from today
+                let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                if persisted_session.day_key == today {
+                    let mut session_guard = state.current_session.lock().unwrap();
+                    *session_guard = Some(CurrentSession {
+                        start_time: now,
+                        day_key: persisted_session.day_key.clone(),
+                        current_lap_start: now,
+                        current_lap_start_timestamp: current_time,
+                        accumulated_seconds: persisted_session.accumulated_seconds,
+                        last_activity_time: now,
+                        is_paused: true, // Always start as paused after restart
+                    });
+                    
+                    println!("✅ Session restored from previous state (marked as paused)");
+                } else {
+                    println!("⚠️ Previous session was from a different day, not restoring");
+                }
+            }
+            
+            println!("✅ State loaded successfully");
+        }
+    }
+}
+
+// Helper function to calculate current lap duration excluding sleep/hibernate time
+fn get_current_lap_duration(session: &mut CurrentSession) -> u64 {
+    if session.is_paused {
+        return session.accumulated_seconds;
+    }
+    
+    let now = Instant::now();
+    let time_since_last_activity = now.duration_since(session.last_activity_time).as_secs();
+    
+    // If more than 5 seconds have passed since last activity check, 
+    // system might have been asleep/locked - don't count that time
+    let gap_threshold = 5;
+    
+    if time_since_last_activity > gap_threshold {
+        // Large gap detected - system was likely asleep/locked
+        // Don't add this gap time, just update the reference point
+        session.last_activity_time = now;
+        return session.accumulated_seconds;
+    }
+    
+    // Normal case: add the time since last activity to accumulated seconds
+    session.accumulated_seconds += time_since_last_activity;
+    session.last_activity_time = now;
+    
+    session.accumulated_seconds
+}
+
 #[tauri::command]
-async fn start_day(state: State<'_, AppState>) -> Result<String, String> {
+async fn start_day(state: State<'_, AppStateArc>) -> Result<String, String> {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     
     let mut session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
@@ -61,6 +187,9 @@ async fn start_day(state: State<'_, AppState>) -> Result<String, String> {
         start_time: now,
         day_key: today.clone(),
         current_lap_start: now,
+        current_lap_start_timestamp: current_time,
+        accumulated_seconds: 0,
+        last_activity_time: now,
         is_paused: false,
     };
     
@@ -84,18 +213,18 @@ async fn start_day(state: State<'_, AppState>) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn end_day(state: State<'_, AppState>) -> Result<DayRecord, String> {
+async fn end_day(state: State<'_, AppStateArc>, app_handle: AppHandle) -> Result<DayRecord, String> {
     let mut session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
     let mut records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
     
-    let session = session_guard.take().ok_or("No active session")?;
+    let mut session = session_guard.take().ok_or("No active session")?;
     let day_key = session.day_key.clone();
     
-    // Calculate final duration for current lap
+    // Calculate final duration for current lap (excluding sleep/hibernate time)
     let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let lap_duration = session.current_lap_start.elapsed().as_secs();
+    let lap_duration = get_current_lap_duration(&mut session);
     
-    if let Some(day_record) = records_guard.get_mut(&day_key) {
+    let result = if let Some(day_record) = records_guard.get_mut(&day_key) {
         // Update the last lap
         if let Some(last_lap) = day_record.laps.last_mut() {
             last_lap.end_time = Some(current_time);
@@ -112,17 +241,26 @@ async fn end_day(state: State<'_, AppState>) -> Result<DayRecord, String> {
         Ok(day_record.clone())
     } else {
         Err("Day record not found".to_string())
-    }
+    };
+    
+    // Release locks before saving
+    drop(session_guard);
+    drop(records_guard);
+    
+    // Save state to disk
+    save_state(&app_handle, &state);
+    
+    result
 }
 
 #[tauri::command]
-async fn handle_screen_lock(state: State<'_, AppState>) -> Result<String, String> {
+async fn handle_screen_lock(state: State<'_, AppStateArc>) -> Result<String, String> {
     let mut session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
     let mut records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
     
     if let Some(session) = session_guard.as_mut() {
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let lap_duration = session.current_lap_start.elapsed().as_secs();
+        let lap_duration = get_current_lap_duration(session);
         
         // End current lap
         if let Some(day_record) = records_guard.get_mut(&session.day_key) {
@@ -132,6 +270,9 @@ async fn handle_screen_lock(state: State<'_, AppState>) -> Result<String, String
             }
         }
         
+        // Mark as paused
+        session.is_paused = true;
+        
         Ok("Screen locked - timer paused".to_string())
     } else {
         Ok("No active session".to_string())
@@ -139,11 +280,12 @@ async fn handle_screen_lock(state: State<'_, AppState>) -> Result<String, String
 }
 
 #[tauri::command]
-async fn handle_screen_unlock(state: State<'_, AppState>) -> Result<String, String> {
+async fn handle_screen_unlock(state: State<'_, AppStateArc>) -> Result<String, String> {
     let mut session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
     let mut records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
     
     if let Some(session) = session_guard.as_mut() {
+        let now = Instant::now();
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         
         // Start new lap
@@ -155,7 +297,12 @@ async fn handle_screen_unlock(state: State<'_, AppState>) -> Result<String, Stri
             });
         }
         
-        session.current_lap_start = Instant::now();
+        // Reset lap tracking
+        session.current_lap_start = now;
+        session.current_lap_start_timestamp = current_time;
+        session.accumulated_seconds = 0;
+        session.last_activity_time = now;
+        session.is_paused = false;
         
         Ok("Screen unlocked - new lap started".to_string())
     } else {
@@ -164,11 +311,11 @@ async fn handle_screen_unlock(state: State<'_, AppState>) -> Result<String, Stri
 }
 
 #[tauri::command]
-async fn get_current_status(state: State<'_, AppState>) -> Result<Option<CurrentStatus>, String> {
-    let session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
+async fn get_current_status(state: State<'_, AppStateArc>) -> Result<Option<CurrentStatus>, String> {
+    let mut session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
     let records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
     
-    if let Some(session) = session_guard.as_ref() {
+    if let Some(session) = session_guard.as_mut() {
         // Calculate total duration from completed laps only
         let mut total_duration = 0u64;
         if let Some(day_record) = records_guard.get(&session.day_key) {
@@ -178,18 +325,17 @@ async fn get_current_status(state: State<'_, AppState>) -> Result<Option<Current
                 .sum();
         }
         
-                if session.is_paused {
-                    // Session is paused - show only completed laps, no current lap time
-                    Ok(Some(CurrentStatus {
-                        day_key: session.day_key.clone(),
-                        current_lap_duration: 0, // No current lap when paused
-                        total_session_duration: total_duration, // Only completed laps
-                        is_active: false, // Not actively tracking
-                    }))
-                } else {
-            // Session is active - include current lap time
-            let current_lap_elapsed = session.current_lap_start.elapsed();
-            let current_lap_seconds = current_lap_elapsed.as_secs();
+        if session.is_paused {
+            // Session is paused - show only completed laps, no current lap time
+            Ok(Some(CurrentStatus {
+                day_key: session.day_key.clone(),
+                current_lap_duration: 0, // No current lap when paused
+                total_session_duration: total_duration, // Only completed laps
+                is_active: false, // Not actively tracking
+            }))
+        } else {
+            // Session is active - include current lap time (excluding sleep/hibernate)
+            let current_lap_seconds = get_current_lap_duration(session);
             let total_with_current_lap = total_duration + current_lap_seconds;
             
             Ok(Some(CurrentStatus {
@@ -214,7 +360,7 @@ pub struct CurrentStatus {
 
 
 #[tauri::command]
-async fn get_current_day_laps(state: State<'_, AppState>) -> Result<Vec<Lap>, String> {
+async fn get_current_day_laps(state: State<'_, AppStateArc>) -> Result<Vec<Lap>, String> {
     let session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
     let records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
     
@@ -230,13 +376,14 @@ async fn get_current_day_laps(state: State<'_, AppState>) -> Result<Vec<Lap>, St
 }
 
 #[tauri::command]
-async fn add_lap(state: State<'_, AppState>) -> Result<String, String> {
+async fn add_lap(state: State<'_, AppStateArc>) -> Result<String, String> {
     let mut session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
     let mut records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
     
     if let Some(session) = session_guard.as_mut() {
+        let now = Instant::now();
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let lap_duration = session.current_lap_start.elapsed().as_secs();
+        let lap_duration = get_current_lap_duration(session);
         
         // End current lap only if it has been running for more than 1 second
         if let Some(day_record) = records_guard.get_mut(&session.day_key) {
@@ -255,8 +402,11 @@ async fn add_lap(state: State<'_, AppState>) -> Result<String, String> {
             });
         }
         
-        // Reset current lap start time and resume session
-        session.current_lap_start = Instant::now();
+        // Reset current lap tracking and resume session
+        session.current_lap_start = now;
+        session.current_lap_start_timestamp = current_time;
+        session.accumulated_seconds = 0;
+        session.last_activity_time = now;
         session.is_paused = false; // Resume the session
         Ok("New lap added successfully - session resumed".to_string())
     } else {
@@ -265,13 +415,13 @@ async fn add_lap(state: State<'_, AppState>) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn stop_lap(state: State<'_, AppState>) -> Result<String, String> {
+async fn stop_lap(state: State<'_, AppStateArc>) -> Result<String, String> {
     let mut session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
     let mut records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
     
     if let Some(session) = session_guard.as_mut() {
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let lap_duration = session.current_lap_start.elapsed().as_secs();
+        let lap_duration = get_current_lap_duration(session);
         
         // End current lap
         if let Some(day_record) = records_guard.get_mut(&session.day_key) {
@@ -283,7 +433,6 @@ async fn stop_lap(state: State<'_, AppState>) -> Result<String, String> {
         
         // Mark session as paused (not ended)
         session.is_paused = true;
-        session.current_lap_start = Instant::now(); // Reset for potential resume
         
         Ok("Lap stopped - session paused".to_string())
     } else {
@@ -295,23 +444,486 @@ async fn stop_lap(state: State<'_, AppState>) -> Result<String, String> {
 
 #[tauri::command]
 async fn check_screen_lock_state() -> Result<bool, String> {
-    // Simple check for screen saver or login window
-    let output = Command::new("sh")
+    // Use the same method as the monitoring function
+    check_screen_lock_state_sync()
+}
+
+#[tauri::command]
+async fn test_screen_lock_detection() -> Result<String, String> {
+    // Test all detection methods
+    let mut results = Vec::new();
+    
+    // Method 1: Display sleep check
+    let display_output = Command::new("sh")
         .arg("-c")
-        .arg("ps aux | grep -i 'ScreenSaverEngine\\|loginwindow' | grep -v grep")
+        .arg("pmset -g ps")
+        .output()
+        .map_err(|e| e.to_string())?;
+    let display_str = String::from_utf8_lossy(&display_output.stdout);
+    results.push(format!("Power state: {}", display_str.trim()));
+    
+    // Method 2: Screen saver check
+    let screensaver_output = Command::new("sh")
+        .arg("-c")
+        .arg("ps aux | grep -E 'ScreenSaverEngine' | grep -v grep")
+        .output()
+        .map_err(|e| e.to_string())?;
+    results.push(format!("Screen saver: {}", if screensaver_output.stdout.is_empty() { "Not running" } else { "Running" }));
+    
+    // Method 3: Login window check
+    let login_output = Command::new("sh")
+        .arg("-c")
+        .arg("ps aux | grep -E 'loginwindow' | grep -v grep | wc -l")
+        .output()
+        .map_err(|e| e.to_string())?;
+    let login_count = String::from_utf8_lossy(&login_output.stdout).trim().parse::<i32>().unwrap_or(0);
+    results.push(format!("Login windows: {}", login_count));
+    
+    // Method 4: Current detection result
+    let current_result = check_screen_lock_state_sync();
+    results.push(format!("Detection result: {}", if current_result.unwrap_or(false) { "LOCKED" } else { "UNLOCKED" }));
+    
+    Ok(results.join("\n"))
+}
+
+
+#[tauri::command]
+async fn handle_system_sleep(state: State<'_, AppStateArc>) -> Result<String, String> {
+    let mut session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
+    let mut records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
+    
+    if let Some(session) = session_guard.as_mut() {
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let lap_duration = get_current_lap_duration(session);
+        
+        // End current lap
+        if let Some(day_record) = records_guard.get_mut(&session.day_key) {
+            if let Some(last_lap) = day_record.laps.last_mut() {
+                last_lap.end_time = Some(current_time);
+                last_lap.duration = Some(lap_duration);
+            }
+        }
+        
+        // Mark session as paused
+        session.is_paused = true;
+        
+        Ok("System sleep detected - lap paused".to_string())
+    } else {
+        Ok("No active session".to_string())
+    }
+}
+
+#[tauri::command]
+async fn handle_system_wake(state: State<'_, AppStateArc>) -> Result<String, String> {
+    let mut session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
+    let mut records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
+    
+    if let Some(session) = session_guard.as_mut() {
+        let now = Instant::now();
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        
+        // Start new lap
+        if let Some(day_record) = records_guard.get_mut(&session.day_key) {
+            day_record.laps.push(Lap {
+                start_time: current_time,
+                end_time: None,
+                duration: None,
+            });
+        }
+        
+        // Reset lap tracking
+        session.current_lap_start = now;
+        session.current_lap_start_timestamp = current_time;
+        session.accumulated_seconds = 0;
+        session.last_activity_time = now;
+        session.is_paused = false; // Resume the session
+        
+        Ok("System wake detected - new lap started".to_string())
+    } else {
+        Ok("No active session".to_string())
+    }
+}
+
+#[tauri::command]
+async fn handle_user_logout(state: State<'_, AppStateArc>) -> Result<String, String> {
+    let mut session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
+    let mut records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
+    
+    if let Some(session) = session_guard.as_mut() {
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let lap_duration = get_current_lap_duration(session);
+        
+        // End current lap
+        if let Some(day_record) = records_guard.get_mut(&session.day_key) {
+            if let Some(last_lap) = day_record.laps.last_mut() {
+                last_lap.end_time = Some(current_time);
+                last_lap.duration = Some(lap_duration);
+            }
+        }
+        
+        // Mark session as paused
+        session.is_paused = true;
+        
+        Ok("User logout detected - lap paused".to_string())
+    } else {
+        Ok("No active session".to_string())
+    }
+}
+
+#[tauri::command]
+async fn handle_user_login(state: State<'_, AppStateArc>) -> Result<String, String> {
+    let mut session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
+    let mut records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
+    
+    if let Some(session) = session_guard.as_mut() {
+        let now = Instant::now();
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        
+        // Start new lap
+        if let Some(day_record) = records_guard.get_mut(&session.day_key) {
+            day_record.laps.push(Lap {
+                start_time: current_time,
+                end_time: None,
+                duration: None,
+            });
+        }
+        
+        // Reset lap tracking
+        session.current_lap_start = now;
+        session.current_lap_start_timestamp = current_time;
+        session.accumulated_seconds = 0;
+        session.last_activity_time = now;
+        session.is_paused = false; // Resume the session
+        
+        Ok("User login detected - new lap started".to_string())
+    } else {
+        Ok("No active session".to_string())
+    }
+}
+
+// System monitoring functions
+fn start_system_monitoring(app_handle: AppHandle, state: AppStateArc) {
+    let state_clone = state.clone();
+    let app_handle_clone = app_handle.clone();
+    
+    thread::spawn(move || {
+        let mut last_screen_lock_state = false;
+        let mut last_sleep_state = false;
+        let mut lock_detection_count = 0;
+        let mut unlock_detection_count = 0;
+        
+        loop {
+            // Check screen lock state
+            match check_screen_lock_state_sync() {
+                Ok(is_locked) => {
+                    // Debounce: require 2 consecutive detections before changing state
+                    if is_locked {
+                        lock_detection_count += 1;
+                        unlock_detection_count = 0;
+                    } else {
+                        unlock_detection_count += 1;
+                        lock_detection_count = 0;
+                    }
+                    
+                    // Only change state after 1 consecutive detection (less strict)
+                    if is_locked && lock_detection_count >= 1 && !last_screen_lock_state {
+                        // Screen just got locked - handle directly
+                        println!("🔒 Screen lock detected!");
+                        handle_screen_lock_direct(&app_handle_clone, &state_clone);
+                        last_screen_lock_state = true;
+                    } else if !is_locked && unlock_detection_count >= 1 && last_screen_lock_state {
+                        // Screen just got unlocked - handle directly
+                        println!("🔓 Screen unlock detected!");
+                        handle_screen_unlock_direct(&app_handle_clone, &state_clone);
+                        last_screen_lock_state = false;
+                    }
+                    
+                    // Debug: Print status every 30 seconds
+                    static mut DEBUG_COUNTER: u32 = 0;
+                    unsafe {
+                        DEBUG_COUNTER += 1;
+                        if DEBUG_COUNTER % 30 == 0 { // Every 30 seconds
+                            println!("🔍 Screen lock status: {} (lock_count: {}, unlock_count: {})", 
+                                if is_locked { "LOCKED" } else { "UNLOCKED" }, 
+                                lock_detection_count, 
+                                unlock_detection_count);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error checking screen lock state: {}", e),
+            }
+            
+            // Check for system sleep/wake events
+            match check_system_sleep_state() {
+                Ok(is_sleeping) => {
+                    if is_sleeping && !last_sleep_state {
+                        // System just went to sleep - handle directly
+                        handle_system_sleep_direct(&app_handle_clone, &state_clone);
+                    } else if !is_sleeping && last_sleep_state {
+                        // System just woke up - handle directly
+                        handle_system_wake_direct(&app_handle_clone, &state_clone);
+                    }
+                    last_sleep_state = is_sleeping;
+                }
+                Err(e) => eprintln!("Error checking system sleep state: {}", e),
+            }
+            
+            thread::sleep(Duration::from_millis(500)); // Check every 500ms for more responsive detection
+        }
+    });
+}
+
+// Direct handlers that don't need State wrapper
+fn handle_screen_lock_direct(app_handle: &AppHandle, state: &AppStateArc) {
+    let mut session_guard = state.current_session.lock().unwrap();
+    let mut records_guard = state.day_records.lock().unwrap();
+    
+    if let Some(session) = session_guard.as_mut() {
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let lap_duration = get_current_lap_duration(session);
+        
+        // End current lap
+        if let Some(day_record) = records_guard.get_mut(&session.day_key) {
+            if let Some(last_lap) = day_record.laps.last_mut() {
+                last_lap.end_time = Some(current_time);
+                last_lap.duration = Some(lap_duration);
+            }
+        }
+        
+        // Mark as paused
+        session.is_paused = true;
+        
+        println!("Screen locked - lap paused (duration: {}s)", lap_duration);
+    }
+    
+    // Release locks before saving
+    drop(session_guard);
+    drop(records_guard);
+    
+    // Save state
+    save_state(app_handle, state);
+}
+
+fn handle_screen_unlock_direct(app_handle: &AppHandle, state: &AppStateArc) {
+    let mut session_guard = state.current_session.lock().unwrap();
+    let mut records_guard = state.day_records.lock().unwrap();
+    
+    if let Some(session) = session_guard.as_mut() {
+        let now = Instant::now();
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        
+        // Start new lap
+        if let Some(day_record) = records_guard.get_mut(&session.day_key) {
+            day_record.laps.push(Lap {
+                start_time: current_time,
+                end_time: None,
+                duration: None,
+            });
+        }
+        
+        // Reset lap tracking
+        session.current_lap_start = now;
+        session.current_lap_start_timestamp = current_time;
+        session.accumulated_seconds = 0;
+        session.last_activity_time = now;
+        session.is_paused = false;
+        
+        println!("Screen unlocked - new lap started");
+    }
+    
+    // Release locks before saving
+    drop(session_guard);
+    drop(records_guard);
+    
+    // Save state
+    save_state(app_handle, state);
+}
+
+fn handle_system_sleep_direct(app_handle: &AppHandle, state: &AppStateArc) {
+    let mut session_guard = state.current_session.lock().unwrap();
+    let mut records_guard = state.day_records.lock().unwrap();
+    
+    if let Some(session) = session_guard.as_mut() {
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let lap_duration = get_current_lap_duration(session);
+        
+        // End current lap
+        if let Some(day_record) = records_guard.get_mut(&session.day_key) {
+            if let Some(last_lap) = day_record.laps.last_mut() {
+                last_lap.end_time = Some(current_time);
+                last_lap.duration = Some(lap_duration);
+            }
+        }
+        
+        // Mark session as paused
+        session.is_paused = true;
+        
+        println!("System sleep detected - lap paused (duration: {}s)", lap_duration);
+    }
+    
+    // Release locks before saving
+    drop(session_guard);
+    drop(records_guard);
+    
+    // Save state
+    save_state(app_handle, state);
+}
+
+fn handle_system_wake_direct(app_handle: &AppHandle, state: &AppStateArc) {
+    let mut session_guard = state.current_session.lock().unwrap();
+    let mut records_guard = state.day_records.lock().unwrap();
+    
+    if let Some(session) = session_guard.as_mut() {
+        let now = Instant::now();
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        
+        // Start new lap
+        if let Some(day_record) = records_guard.get_mut(&session.day_key) {
+            day_record.laps.push(Lap {
+                start_time: current_time,
+                end_time: None,
+                duration: None,
+            });
+        }
+        
+        // Reset lap tracking
+        session.current_lap_start = now;
+        session.current_lap_start_timestamp = current_time;
+        session.accumulated_seconds = 0;
+        session.last_activity_time = now;
+        session.is_paused = false; // Resume the session
+        
+        println!("System wake detected - new lap started");
+    }
+    
+    // Release locks before saving
+    drop(session_guard);
+    drop(records_guard);
+    
+    // Save state
+    save_state(app_handle, state);
+}
+
+fn check_screen_lock_state_sync() -> Result<bool, String> {
+    // Use the macOS-specific detection method
+    #[cfg(target_os = "macos")]
+    {
+        return check_macos_screen_lock_state();
+    }
+    
+    // For non-macOS systems, return false
+    #[cfg(not(target_os = "macos"))]
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn start_macos_screen_lock_monitoring(app_handle: AppHandle, state: AppStateArc) {
+    // For now, let's use a simpler approach that actually works
+    // We'll monitor system events using a different method
+    thread::spawn(move || {
+        let mut last_screen_lock_state = false;
+        let mut lock_detection_count = 0;
+        let mut unlock_detection_count = 0;
+        
+        loop {
+            // Check for screen lock using a more reliable method
+            match check_macos_screen_lock_state() {
+                Ok(is_locked) => {
+                    // Debug: Print current state
+                    println!("🔍 Current lock state: {}", if is_locked { "LOCKED" } else { "UNLOCKED" });
+                    
+                    // Debounce: require 2 consecutive detections before changing state
+                    if is_locked {
+                        lock_detection_count += 1;
+                        unlock_detection_count = 0;
+                    } else {
+                        unlock_detection_count += 1;
+                        lock_detection_count = 0;
+                    }
+                    
+                    // Only change state after 2 consecutive detections
+                    if is_locked && lock_detection_count >= 2 && !last_screen_lock_state {
+                        println!("🔒 macOS Screen lock detected! (confirmed)");
+                        handle_screen_lock_direct(&app_handle, &state);
+                        last_screen_lock_state = true;
+                    } else if !is_locked && unlock_detection_count >= 2 && last_screen_lock_state {
+                        println!("🔓 macOS Screen unlock detected! (confirmed)");
+                        handle_screen_unlock_direct(&app_handle, &state);
+                        last_screen_lock_state = false;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error checking screen lock state: {}", e);
+                }
+            }
+            
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn check_macos_screen_lock_state() -> Result<bool, String> {
+    // Use a more reliable method to detect screen lock on macOS
+    
+    // Method 1: Check for screen saver processes
+    let screensaver_output = Command::new("sh")
+        .arg("-c")
+        .arg("ps aux | grep -E 'ScreenSaverEngine' | grep -v grep")
         .output()
         .map_err(|e| e.to_string())?;
     
-    Ok(!output.stdout.is_empty())
+    if !screensaver_output.stdout.is_empty() {
+        return Ok(true);
+    }
+    
+    // Method 2: Check for display sleep using pmset
+    let display_sleep = Command::new("sh")
+        .arg("-c")
+        .arg("pmset -g ps | grep -E 'sleep.*[1-9]'")
+        .output()
+        .map_err(|e| e.to_string())?;
+    
+    if !display_sleep.stdout.is_empty() {
+        return Ok(true);
+    }
+    
+    // Method 3: Check for login window processes (indicates screen is locked)
+    let login_output = Command::new("sh")
+        .arg("-c")
+        .arg("ps aux | grep -E 'loginwindow' | grep -v grep | wc -l")
+        .output()
+        .map_err(|e| e.to_string())?;
+    
+    let login_count = String::from_utf8_lossy(&login_output.stdout).trim().parse::<i32>().unwrap_or(0);
+    if login_count > 1 { // More than just the system loginwindow
+        return Ok(true);
+    }
+    
+    Ok(false)
+}
+
+fn check_system_sleep_state() -> Result<bool, String> {
+    // Check if system is in sleep mode by looking at power management
+    let output = Command::new("pmset")
+        .arg("-g")
+        .arg("ps")
+        .output()
+        .map_err(|e| e.to_string())?;
+    
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    // If we can get power state info, system is awake
+    // If command fails or returns empty, system might be sleeping
+    Ok(output_str.is_empty() || output_str.contains("sleep"))
 }
 
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app_state = AppState::new();
+    let app_state = Arc::new(AppState::new());
     
     tauri::Builder::default()
-        .manage(app_state)
+        .manage(app_state.clone())
         .invoke_handler(tauri::generate_handler![
             start_day,
             end_day,
@@ -321,8 +933,38 @@ pub fn run() {
             get_current_day_laps,
             add_lap,
             stop_lap,
-            check_screen_lock_state
+            check_screen_lock_state,
+            test_screen_lock_detection,
+            handle_system_sleep,
+            handle_system_wake,
+            handle_user_logout,
+            handle_user_login
         ])
+        .setup(move |app| {
+            let app_handle = app.handle().clone();
+            
+            // Load saved state from disk
+            load_state(&app_handle, &app_state);
+            
+            // Start system monitoring when app starts
+            start_system_monitoring(app_handle.clone(), app_state.clone());
+            
+            // Start macOS-specific screen lock monitoring
+            #[cfg(target_os = "macos")]
+            start_macos_screen_lock_monitoring(app_handle.clone(), app_state.clone());
+            
+            // Start periodic state saving (every 30 seconds)
+            let state_for_autosave = app_state.clone();
+            let handle_for_autosave = app_handle.clone();
+            thread::spawn(move || {
+                loop {
+                    thread::sleep(Duration::from_secs(30));
+                    save_state(&handle_for_autosave, &state_for_autosave);
+                }
+            });
+            
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

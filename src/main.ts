@@ -39,7 +39,13 @@ class ScreenTimeTracker {
       <div class="container">
         <header class="header">
           <h1>🕒 Screen Time Tracker</h1>
-          <p class="subtitle">Track your daily screen time with automatic pause on screen lock</p>
+          <p class="subtitle">Track your daily screen time with automatic lap management</p>
+          <div class="auto-features">
+            <div class="feature-item">🔒 Auto-pause on screen lock</div>
+            <div class="feature-item">💤 Auto-pause on sleep/hibernate</div>
+            <div class="feature-item">👤 Auto-pause on logout</div>
+            <div class="feature-item">▶️ Auto-resume on unlock/wake/login</div>
+          </div>
         </header>
 
         <main class="main-content">
@@ -73,6 +79,9 @@ class ScreenTimeTracker {
             <div class="controls">
               <button id="start-day-btn" class="btn btn-primary">Start Day</button>
               <button id="end-day-btn" class="btn btn-secondary" disabled>End Day</button>
+              <button id="test-lock-btn" class="btn btn-lap">Test Lock Detection</button>
+              <button id="manual-lock-btn" class="btn btn-stop">Simulate Lock</button>
+              <button id="manual-unlock-btn" class="btn btn-lap">Simulate Unlock</button>
             </div>
           </section>
         </main>
@@ -84,10 +93,16 @@ class ScreenTimeTracker {
     const startDayBtn = document.getElementById('start-day-btn');
     const endDayBtn = document.getElementById('end-day-btn');
     const addLapBtn = document.getElementById('add-lap-btn');
+    const testLockBtn = document.getElementById('test-lock-btn');
+    const manualLockBtn = document.getElementById('manual-lock-btn');
+    const manualUnlockBtn = document.getElementById('manual-unlock-btn');
 
     startDayBtn?.addEventListener('click', () => this.startDay());
     endDayBtn?.addEventListener('click', () => this.endDay());
     addLapBtn?.addEventListener('click', () => this.addLap());
+    testLockBtn?.addEventListener('click', () => this.testLockDetection());
+    manualLockBtn?.addEventListener('click', () => this.simulateLock());
+    manualUnlockBtn?.addEventListener('click', () => this.simulateUnlock());
   }
 
   private async startDay(): Promise<void> {
@@ -124,6 +139,39 @@ class ScreenTimeTracker {
     }
   }
 
+  private async testLockDetection(): Promise<void> {
+    try {
+      const result = await invoke<string>('test_screen_lock_detection');
+      this.showNotification(`Lock Detection Test:\n${result}`, 'success');
+      console.log('Lock detection test:', result);
+    } catch (error) {
+      this.showNotification(`Failed to test lock detection: ${error}`, 'error');
+    }
+  }
+
+  private async simulateLock(): Promise<void> {
+    try {
+      const result = await invoke<string>('handle_screen_lock');
+      this.showNotification(`Simulated Lock: ${result}`, 'success');
+      console.log('Simulated lock:', result);
+      await this.loadCurrentStatus();
+    } catch (error) {
+      this.showNotification(`Failed to simulate lock: ${error}`, 'error');
+    }
+  }
+
+  private async simulateUnlock(): Promise<void> {
+    try {
+      const result = await invoke<string>('handle_screen_unlock');
+      this.showNotification(`Simulated Unlock: ${result}`, 'success');
+      console.log('Simulated unlock:', result);
+      await this.loadCurrentStatus();
+    } catch (error) {
+      this.showNotification(`Failed to simulate unlock: ${error}`, 'error');
+    }
+  }
+
+
   private async stopLap(): Promise<void> {
     try {
       const result = await invoke<string>('stop_lap');
@@ -147,7 +195,7 @@ class ScreenTimeTracker {
       this.currentStatus = await invoke<CurrentStatus | null>('get_current_status');
 
       // Update isTracking state based on backend response
-      this.isTracking = this.currentStatus && this.currentStatus.is_active;
+      this.isTracking = this.currentStatus?.is_active ?? false;
 
 
       // Update button states when session state changes
@@ -333,9 +381,40 @@ class ScreenTimeTracker {
 
 
   private async startScreenLockMonitoring(): Promise<void> {
-    // Screen lock monitoring is now handled by the backend automatically
-    // No need to start it explicitly since we removed the complex monitoring
-    console.log('Screen lock monitoring is handled automatically by the backend');
+    // System monitoring is now handled by the backend automatically
+    // This includes screen lock, sleep/wake, and logout/login events
+    console.log('System monitoring is handled automatically by the backend');
+
+    // Add event listeners for system events that might be detected by the frontend
+    this.setupSystemEventListeners();
+  }
+
+  private setupSystemEventListeners(): void {
+    // Listen for visibility changes (when user switches tabs or minimizes)
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        console.log('App became hidden - system may be locking or sleeping');
+      } else {
+        console.log('App became visible - system may have unlocked or woken');
+        // Refresh status when app becomes visible again
+        this.loadCurrentStatus();
+      }
+    });
+
+    // Listen for window focus/blur events
+    window.addEventListener('blur', () => {
+      console.log('Window lost focus - may indicate system events');
+    });
+
+    window.addEventListener('focus', () => {
+      console.log('Window gained focus - refreshing status');
+      this.loadCurrentStatus();
+    });
+
+    // Listen for page unload (user closing app or logging out)
+    window.addEventListener('beforeunload', () => {
+      console.log('App is being closed - system will handle lap management');
+    });
   }
 
 
