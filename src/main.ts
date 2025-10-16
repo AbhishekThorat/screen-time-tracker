@@ -348,6 +348,23 @@ class ScreenTimeTracker {
     // Display current lap only if session is actively tracking
     if (currentLap && isActive) {
       const startTime = new Date(currentLap.start_time * 1000);
+      const currentTimeSeconds = Math.floor(Date.now() / 1000); // Current time in seconds (rounded down)
+      const lapDuration = currentTimeSeconds - currentLap.start_time;
+
+      // Debug logging
+      console.log('Current lap check:', {
+        startTime: currentLap.start_time,
+        currentTime: currentTimeSeconds,
+        lapDuration: lapDuration,
+        canStop: lapDuration >= 3
+      });
+
+      // Only show stop button if lap has been running for at least 3 seconds
+      // (matches backend logic that removes laps < 3 seconds)
+      const canStop = lapDuration >= 3;
+      const stopButton = canStop
+        ? `<button class="btn btn-stop btn-small" onclick="window.stopCurrentLap()">Stop</button>`
+        : `<span class="lap-wait-text">⏳ Wait ${Math.ceil(3 - lapDuration)}s to stop</span>`;
 
       lapsHtml += `
         <div class="lap-item current">
@@ -358,7 +375,7 @@ class ScreenTimeTracker {
                 ${startTime.toLocaleTimeString()} - Ongoing
               </div>
             </div>
-            <button class="btn btn-stop btn-small" onclick="window.stopCurrentLap()">Stop</button>
+            ${stopButton}
           </div>
         </div>
       `;
