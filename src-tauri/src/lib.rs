@@ -8,8 +8,14 @@ use std::thread;
 use std::time::Duration;
 use std::fs;
 use std::path::PathBuf;
+use std::ffi::CStr;
 
-// macOS-specific imports removed since we're not using system notifications anymore
+#[cfg(target_os = "macos")]
+use cocoa::base::{id, nil};
+#[cfg(target_os = "macos")]
+use cocoa::foundation::NSString;
+#[cfg(target_os = "macos")]
+use objc::{class, msg_send, sel, sel_impl};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lap {
@@ -637,18 +643,6 @@ fn start_system_monitoring(app_handle: AppHandle, state: AppStateArc) {
                         handle_screen_unlock_direct(&app_handle_clone, &state_clone);
                         last_screen_lock_state = false;
                     }
-                    
-                    // Debug: Print status every 30 seconds
-                    static mut DEBUG_COUNTER: u32 = 0;
-                    unsafe {
-                        DEBUG_COUNTER += 1;
-                        if DEBUG_COUNTER % 30 == 0 { // Every 30 seconds
-                            println!("🔍 Screen lock status: {} (lock_count: {}, unlock_count: {})", 
-                                if is_locked { "LOCKED" } else { "UNLOCKED" }, 
-                                lock_detection_count, 
-                                unlock_detection_count);
-                        }
-                    }
                 }
                 Err(e) => eprintln!("Error checking screen lock state: {}", e),
             }
@@ -818,8 +812,6 @@ fn check_screen_lock_state_sync() -> Result<bool, String> {
 
 #[cfg(target_os = "macos")]
 fn start_macos_screen_lock_monitoring(app_handle: AppHandle, state: AppStateArc) {
-    // For now, let's use a simpler approach that actually works
-    // We'll monitor system events using a different method
     thread::spawn(move || {
         let mut last_screen_lock_state = false;
         let mut lock_detection_count = 0;
@@ -829,9 +821,6 @@ fn start_macos_screen_lock_monitoring(app_handle: AppHandle, state: AppStateArc)
             // Check for screen lock using a more reliable method
             match check_macos_screen_lock_state() {
                 Ok(is_locked) => {
-                    // Debug: Print current state
-                    println!("🔍 Current lock state: {}", if is_locked { "LOCKED" } else { "UNLOCKED" });
-                    
                     // Debounce: require 2 consecutive detections before changing state
                     if is_locked {
                         lock_detection_count += 1;
@@ -843,17 +832,17 @@ fn start_macos_screen_lock_monitoring(app_handle: AppHandle, state: AppStateArc)
                     
                     // Only change state after 2 consecutive detections
                     if is_locked && lock_detection_count >= 2 && !last_screen_lock_state {
-                        println!("🔒 macOS Screen lock detected! (confirmed)");
+                        println!("🔒 macOS Screen lock detected!");
                         handle_screen_lock_direct(&app_handle, &state);
                         last_screen_lock_state = true;
                     } else if !is_locked && unlock_detection_count >= 2 && last_screen_lock_state {
-                        println!("🔓 macOS Screen unlock detected! (confirmed)");
+                        println!("🔓 macOS Screen unlock detected!");
                         handle_screen_unlock_direct(&app_handle, &state);
                         last_screen_lock_state = false;
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error checking screen lock state: {}", e);
+                    eprintln!("❌ Error checking screen lock state: {}", e);
                 }
             }
             
@@ -864,12 +853,36 @@ fn start_macos_screen_lock_monitoring(app_handle: AppHandle, state: AppStateArc)
 
 #[cfg(target_os = "macos")]
 fn check_macos_screen_lock_state() -> Result<bool, String> {
-    // Use a more reliable method to detect screen lock on macOS
+    // Method 1: Use native Cocoa/Objective-C to check session state
+    unsafe {
+        let ws_class = class!(NSWorkspace);
+        let shared_workspace: id = msg_send![ws_class, sharedWorkspace];
+        
+        // Check if screen is locked by looking at the active space
+        // When locked, we won't be able to get active application
+        let active_app: id = msg_send![shared_workspace, frontmostApplication];
+        if active_app == nil {
+            return Ok(true); // No frontmost app usually means locked
+        }
+        
+        // Get the localized name of the frontmost application
+        let app_name: id = msg_send![active_app, localizedName];
+        if app_name != nil {
+            let name_str: *const i8 = msg_send![app_name, UTF8String];
+            if !name_str.is_null() {
+                let name = std::ffi::CStr::from_ptr(name_str).to_string_lossy();
+                // If loginwindow or ScreenSaverEngine is frontmost, screen is locked
+                if name == "loginwindow" || name == "ScreenSaverEngine" {
+                    return Ok(true);
+                }
+            }
+        }
+    }
     
-    // Method 1: Check for screen saver processes
-    let screensaver_output = Command::new("sh")
-        .arg("-c")
-        .arg("ps aux | grep -E 'ScreenSaverEngine' | grep -v grep")
+    // Method 2: Check for screen saver process
+    let screensaver_output = Command::new("pgrep")
+        .arg("-x")
+        .arg("ScreenSaverEngine")
         .output()
         .map_err(|e| e.to_string())?;
     
@@ -877,27 +890,19 @@ fn check_macos_screen_lock_state() -> Result<bool, String> {
         return Ok(true);
     }
     
-    // Method 2: Check for display sleep using pmset
-    let display_sleep = Command::new("sh")
-        .arg("-c")
-        .arg("pmset -g ps | grep -E 'sleep.*[1-9]'")
+    // Method 3: Use AppleScript to check frontmost process (more reliable)
+    let script_output = Command::new("osascript")
+        .arg("-e")
+        .arg("tell application \"System Events\" to get name of first process whose frontmost is true")
         .output()
         .map_err(|e| e.to_string())?;
     
-    if !display_sleep.stdout.is_empty() {
-        return Ok(true);
-    }
-    
-    // Method 3: Check for login window processes (indicates screen is locked)
-    let login_output = Command::new("sh")
-        .arg("-c")
-        .arg("ps aux | grep -E 'loginwindow' | grep -v grep | wc -l")
-        .output()
-        .map_err(|e| e.to_string())?;
-    
-    let login_count = String::from_utf8_lossy(&login_output.stdout).trim().parse::<i32>().unwrap_or(0);
-    if login_count > 1 { // More than just the system loginwindow
-        return Ok(true);
+    if script_output.status.success() {
+        let frontmost = String::from_utf8_lossy(&script_output.stdout);
+        let frontmost_trimmed = frontmost.trim();
+        if frontmost_trimmed == "loginwindow" || frontmost_trimmed == "ScreenSaverEngine" {
+            return Ok(true);
+        }
     }
     
     Ok(false)
