@@ -351,14 +351,6 @@ class ScreenTimeTracker {
       const currentTimeSeconds = Math.floor(Date.now() / 1000); // Current time in seconds (rounded down)
       const lapDuration = currentTimeSeconds - currentLap.start_time;
 
-      // Debug logging
-      console.log('Current lap check:', {
-        startTime: currentLap.start_time,
-        currentTime: currentTimeSeconds,
-        lapDuration: lapDuration,
-        canStop: lapDuration >= 3
-      });
-
       // Only show stop button if lap has been running for at least 3 seconds
       // (matches backend logic that removes laps < 3 seconds)
       const canStop = lapDuration >= 3;
