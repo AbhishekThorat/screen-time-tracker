@@ -48,6 +48,7 @@ pub struct CurrentSession {
     pub accumulated_seconds: u64, // Accumulated seconds for current lap
     pub last_activity_time: Instant, // To detect sleep/hibernate gaps
     pub is_paused: bool,
+    pub user_paused: bool, // True if user manually paused, false if system paused (lock/sleep)
 }
 
 impl AppState {
@@ -134,6 +135,7 @@ fn load_state(app_handle: &AppHandle, state: &AppStateArc) {
                         accumulated_seconds: persisted_session.accumulated_seconds,
                         last_activity_time: now,
                         is_paused: true, // Always start as paused after restart
+                        user_paused: false, // System paused (restart), not user paused
                     });
                     
                     println!("✅ Session restored from previous state (marked as paused)");
@@ -197,6 +199,7 @@ async fn start_day(state: State<'_, AppStateArc>) -> Result<String, String> {
         accumulated_seconds: 0,
         last_activity_time: now,
         is_paused: false,
+        user_paused: false,
     };
     
     *session_guard = Some(session);
@@ -276,8 +279,9 @@ async fn handle_screen_lock(state: State<'_, AppStateArc>) -> Result<String, Str
             }
         }
         
-        // Mark as paused
+        // Mark as paused by system
         session.is_paused = true;
+        session.user_paused = false; // System paused
         
         Ok("Screen locked - timer paused".to_string())
     } else {
@@ -291,26 +295,31 @@ async fn handle_screen_unlock(state: State<'_, AppStateArc>) -> Result<String, S
     let mut records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
     
     if let Some(session) = session_guard.as_mut() {
-        let now = Instant::now();
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        
-        // Start new lap
-        if let Some(day_record) = records_guard.get_mut(&session.day_key) {
-            day_record.laps.push(Lap {
-                start_time: current_time,
-                end_time: None,
-                duration: None,
-            });
+        // Only auto-start if user didn't manually pause
+        if !session.user_paused {
+            let now = Instant::now();
+            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            
+            // Start new lap
+            if let Some(day_record) = records_guard.get_mut(&session.day_key) {
+                day_record.laps.push(Lap {
+                    start_time: current_time,
+                    end_time: None,
+                    duration: None,
+                });
+            }
+            
+            // Reset lap tracking
+            session.current_lap_start = now;
+            session.current_lap_start_timestamp = current_time;
+            session.accumulated_seconds = 0;
+            session.last_activity_time = now;
+            session.is_paused = false;
+            
+            Ok("Screen unlocked - new lap started".to_string())
+        } else {
+            Ok("Screen unlocked - session remains paused (user paused)".to_string())
         }
-        
-        // Reset lap tracking
-        session.current_lap_start = now;
-        session.current_lap_start_timestamp = current_time;
-        session.accumulated_seconds = 0;
-        session.last_activity_time = now;
-        session.is_paused = false;
-        
-        Ok("Screen unlocked - new lap started".to_string())
     } else {
         Ok("No active session".to_string())
     }
@@ -414,6 +423,7 @@ async fn add_lap(state: State<'_, AppStateArc>) -> Result<String, String> {
         session.accumulated_seconds = 0;
         session.last_activity_time = now;
         session.is_paused = false; // Resume the session
+        session.user_paused = false; // Clear user pause flag
         Ok("New lap added successfully - session resumed".to_string())
     } else {
         Err("No active session".to_string())
@@ -426,19 +436,48 @@ async fn stop_lap(state: State<'_, AppStateArc>) -> Result<String, String> {
     let mut records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
     
     if let Some(session) = session_guard.as_mut() {
+        if session.is_paused {
+            return Err("Session is already paused".to_string());
+        }
+        
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let lap_duration = get_current_lap_duration(session);
         
-        // End current lap
-        if let Some(day_record) = records_guard.get_mut(&session.day_key) {
-            if let Some(last_lap) = day_record.laps.last_mut() {
-                last_lap.end_time = Some(current_time);
-                last_lap.duration = Some(lap_duration);
+        // If lap is very short (< 3 seconds), remove it instead of keeping it
+        if lap_duration < 3 {
+            if let Some(day_record) = records_guard.get_mut(&session.day_key) {
+                // Remove the last lap if it's too short
+                if let Some(last_lap) = day_record.laps.last() {
+                    if last_lap.duration.is_none() {
+                        // This is the active lap, remove it
+                        day_record.laps.pop();
+                        
+                        // Mark session as paused by user and reset accumulated time
+                        session.is_paused = true;
+                        session.user_paused = true; // User manually paused
+                        session.accumulated_seconds = 0;
+                        
+                        println!("🗑️ Very short lap ({}s) removed - session paused by user", lap_duration);
+                        return Ok("Very short lap removed - session paused".to_string());
+                    }
+                }
             }
         }
         
-        // Mark session as paused (not ended)
+        // End current lap normally
+        if let Some(day_record) = records_guard.get_mut(&session.day_key) {
+            if let Some(last_lap) = day_record.laps.last_mut() {
+                if last_lap.duration.is_none() {
+                    last_lap.end_time = Some(current_time);
+                    last_lap.duration = Some(lap_duration);
+                    println!("⏸️ Lap stopped ({}s) - session paused", lap_duration);
+                }
+            }
+        }
+        
+        // Mark session as paused by user (not ended)
         session.is_paused = true;
+        session.user_paused = true; // User manually paused
         
         Ok("Lap stopped - session paused".to_string())
     } else {
@@ -684,10 +723,11 @@ fn handle_screen_lock_direct(app_handle: &AppHandle, state: &AppStateArc) {
             }
         }
         
-        // Mark as paused
+        // Mark as paused by system (not user)
         session.is_paused = true;
+        session.user_paused = false; // System paused, not user
         
-        println!("Screen locked - lap paused (duration: {}s)", lap_duration);
+        println!("🔒 Screen locked - lap paused (duration: {}s)", lap_duration);
     }
     
     // Release locks before saving
@@ -703,26 +743,32 @@ fn handle_screen_unlock_direct(app_handle: &AppHandle, state: &AppStateArc) {
     let mut records_guard = state.day_records.lock().unwrap();
     
     if let Some(session) = session_guard.as_mut() {
-        let now = Instant::now();
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        
-        // Start new lap
-        if let Some(day_record) = records_guard.get_mut(&session.day_key) {
-            day_record.laps.push(Lap {
-                start_time: current_time,
-                end_time: None,
-                duration: None,
-            });
+        // Only auto-start a new lap if user didn't manually pause
+        // If user manually paused, respect their choice and don't auto-resume
+        if !session.user_paused {
+            let now = Instant::now();
+            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            
+            // Start new lap
+            if let Some(day_record) = records_guard.get_mut(&session.day_key) {
+                day_record.laps.push(Lap {
+                    start_time: current_time,
+                    end_time: None,
+                    duration: None,
+                });
+            }
+            
+            // Reset lap tracking and resume
+            session.current_lap_start = now;
+            session.current_lap_start_timestamp = current_time;
+            session.accumulated_seconds = 0;
+            session.last_activity_time = now;
+            session.is_paused = false; // Resume active tracking
+            
+            println!("🔓 Screen unlocked - new lap auto-started");
+        } else {
+            println!("🔓 Screen unlocked - session remains paused (user paused manually)");
         }
-        
-        // Reset lap tracking
-        session.current_lap_start = now;
-        session.current_lap_start_timestamp = current_time;
-        session.accumulated_seconds = 0;
-        session.last_activity_time = now;
-        session.is_paused = false;
-        
-        println!("Screen unlocked - new lap started");
     }
     
     // Release locks before saving
@@ -749,10 +795,11 @@ fn handle_system_sleep_direct(app_handle: &AppHandle, state: &AppStateArc) {
             }
         }
         
-        // Mark session as paused
+        // Mark session as paused by system (not user)
         session.is_paused = true;
+        session.user_paused = false; // System paused, not user
         
-        println!("System sleep detected - lap paused (duration: {}s)", lap_duration);
+        println!("💤 System sleep detected - lap paused (duration: {}s)", lap_duration);
     }
     
     // Release locks before saving
@@ -768,26 +815,31 @@ fn handle_system_wake_direct(app_handle: &AppHandle, state: &AppStateArc) {
     let mut records_guard = state.day_records.lock().unwrap();
     
     if let Some(session) = session_guard.as_mut() {
-        let now = Instant::now();
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        
-        // Start new lap
-        if let Some(day_record) = records_guard.get_mut(&session.day_key) {
-            day_record.laps.push(Lap {
-                start_time: current_time,
-                end_time: None,
-                duration: None,
-            });
+        // Only auto-start if user didn't manually pause
+        if !session.user_paused {
+            let now = Instant::now();
+            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            
+            // Start new lap
+            if let Some(day_record) = records_guard.get_mut(&session.day_key) {
+                day_record.laps.push(Lap {
+                    start_time: current_time,
+                    end_time: None,
+                    duration: None,
+                });
+            }
+            
+            // Reset lap tracking and resume
+            session.current_lap_start = now;
+            session.current_lap_start_timestamp = current_time;
+            session.accumulated_seconds = 0;
+            session.last_activity_time = now;
+            session.is_paused = false; // Resume the session
+            
+            println!("⏰ System wake detected - new lap auto-started");
+        } else {
+            println!("⏰ System wake - session remains paused (user paused manually)");
         }
-        
-        // Reset lap tracking
-        session.current_lap_start = now;
-        session.current_lap_start_timestamp = current_time;
-        session.accumulated_seconds = 0;
-        session.last_activity_time = now;
-        session.is_paused = false; // Resume the session
-        
-        println!("System wake detected - new lap started");
     }
     
     // Release locks before saving

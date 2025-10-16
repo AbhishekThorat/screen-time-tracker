@@ -302,14 +302,15 @@ class ScreenTimeTracker {
   private async loadCurrentDayLaps(): Promise<void> {
     try {
       const laps = await invoke<Lap[]>('get_current_day_laps');
-      this.displayLaps(laps);
+      const isActive = this.currentStatus?.is_active ?? false;
+      this.displayLaps(laps, isActive);
       this.showLapsSection();
     } catch (error) {
       console.error('Failed to load current day laps:', error);
     }
   }
 
-  private displayLaps(laps: Lap[]): void {
+  private displayLaps(laps: Lap[], isActive: boolean): void {
     const lapsList = document.getElementById('laps-list');
     if (!lapsList) return;
 
@@ -344,9 +345,10 @@ class ScreenTimeTracker {
       `;
     });
 
-    // Display current lap if exists
-    if (currentLap) {
+    // Display current lap only if session is actively tracking
+    if (currentLap && isActive) {
       const startTime = new Date(currentLap.start_time * 1000);
+
       lapsHtml += `
         <div class="lap-item current">
           <div class="lap-info">
