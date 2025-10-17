@@ -8,12 +8,9 @@ use std::thread;
 use std::time::Duration;
 use std::fs;
 use std::path::PathBuf;
-use std::ffi::CStr;
 
 #[cfg(target_os = "macos")]
 use cocoa::base::{id, nil};
-#[cfg(target_os = "macos")]
-use cocoa::foundation::NSString;
 #[cfg(target_os = "macos")]
 use objc::{class, msg_send, sel, sel_impl};
 

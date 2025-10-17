@@ -303,14 +303,15 @@ class ScreenTimeTracker {
     try {
       const laps = await invoke<Lap[]>('get_current_day_laps');
       const isActive = this.currentStatus?.is_active ?? false;
-      this.displayLaps(laps, isActive);
+      const currentLapDuration = this.currentStatus?.current_lap_duration ?? 0;
+      this.displayLaps(laps, isActive, currentLapDuration);
       this.showLapsSection();
     } catch (error) {
       console.error('Failed to load current day laps:', error);
     }
   }
 
-  private displayLaps(laps: Lap[], isActive: boolean): void {
+  private displayLaps(laps: Lap[], isActive: boolean, currentLapDuration: number): void {
     const lapsList = document.getElementById('laps-list');
     if (!lapsList) return;
 
@@ -348,15 +349,13 @@ class ScreenTimeTracker {
     // Display current lap only if session is actively tracking
     if (currentLap && isActive) {
       const startTime = new Date(currentLap.start_time * 1000);
-      const currentTimeSeconds = Math.floor(Date.now() / 1000); // Current time in seconds (rounded down)
-      const lapDuration = currentTimeSeconds - currentLap.start_time;
 
+      // Use backend's current_lap_duration which already excludes sleep/background time
       // Only show stop button if lap has been running for at least 3 seconds
-      // (matches backend logic that removes laps < 3 seconds)
-      const canStop = lapDuration >= 3;
+      const canStop = currentLapDuration >= 3;
       const stopButton = canStop
         ? `<button class="btn btn-stop btn-small" onclick="window.stopCurrentLap()">Stop</button>`
-        : `<span class="lap-wait-text">⏳ Wait ${Math.ceil(3 - lapDuration)}s to stop</span>`;
+        : `<span class="lap-wait-text">⏳ Wait ${Math.ceil(3 - currentLapDuration)}s to stop</span>`;
 
       lapsHtml += `
         <div class="lap-item current">
