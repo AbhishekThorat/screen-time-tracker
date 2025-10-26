@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 interface CurrentStatus {
   day_key: string;
   current_lap_duration: number;
+  current_lap_start_timestamp: number;
   total_session_duration: number;
   is_active: boolean;
 }
@@ -79,9 +80,6 @@ class ScreenTimeTracker {
             <div class="controls">
               <button id="start-day-btn" class="btn btn-primary">Start Day</button>
               <button id="end-day-btn" class="btn btn-secondary" disabled>End Day</button>
-              <button id="test-lock-btn" class="btn btn-lap">Test Lock Detection</button>
-              <button id="manual-lock-btn" class="btn btn-stop">Simulate Lock</button>
-              <button id="manual-unlock-btn" class="btn btn-lap">Simulate Unlock</button>
             </div>
           </section>
         </main>
@@ -221,11 +219,22 @@ class ScreenTimeTracker {
 
     // Only show dynamic timers if there's an active session
     if (this.currentStatus && this.currentStatus.is_active) {
+      // Use backend's duration as base (already excludes gaps/sleep)
+      // Add sub-second precision for smooth counting
+      const backendDuration = this.currentStatus.current_lap_duration;
+      const currentTimeMs = Date.now();
+      const subSecondOffset = (currentTimeMs % 1000) / 1000; // 0.0 to 0.999
+      const smoothLapDuration = backendDuration + subSecondOffset;
+
+      // Calculate completed laps total (exclude current lap from backend's total)
+      const completedLapsTotal = this.currentStatus.total_session_duration - this.currentStatus.current_lap_duration;
+      const smoothTotal = completedLapsTotal + smoothLapDuration;
+
       if (currentTimer) {
-        currentTimer.textContent = this.formatTime(this.currentStatus.current_lap_duration);
+        currentTimer.textContent = this.formatTime(Math.floor(smoothLapDuration));
       }
       if (totalTimer) {
-        totalTimer.textContent = this.formatTime(this.currentStatus.total_session_duration);
+        totalTimer.textContent = this.formatTime(Math.floor(smoothTotal));
       }
       if (sessionInfo) {
         sessionInfo.textContent = `Active session for ${this.currentStatus.day_key}`;
@@ -295,7 +304,7 @@ class ScreenTimeTracker {
     window.setInterval(async () => {
       // Always check the backend status to stay in sync
       await this.loadCurrentStatus();
-    }, 1000);
+    }, 200); // Update 5x per second for smooth display
   }
 
 

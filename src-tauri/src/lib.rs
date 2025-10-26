@@ -146,28 +146,36 @@ fn load_state(app_handle: &AppHandle, state: &AppStateArc) {
     }
 }
 
-// Helper function to calculate current lap duration excluding sleep/hibernate time
-fn get_current_lap_duration(session: &mut CurrentSession) -> u64 {
+// Read-only: Calculate display duration (called frequently for status)
+fn calculate_display_lap_duration(session: &CurrentSession) -> u64 {
     if session.is_paused {
         return session.accumulated_seconds;
     }
     
     let now = Instant::now();
-    let time_since_last_activity = now.duration_since(session.last_activity_time).as_secs();
+    let time_since_last = now.duration_since(session.last_activity_time).as_secs();
     
-    // If more than 5 seconds have passed since last activity check, 
-    // system might have been asleep/locked - don't count that time
-    let gap_threshold = 5;
-    
-    if time_since_last_activity > gap_threshold {
-        // Large gap detected - system was likely asleep/locked
-        // Don't add this gap time, just update the reference point
-        session.last_activity_time = now;
+    // If gap > 5s detected, don't include it in display
+    if time_since_last > 5 {
         return session.accumulated_seconds;
     }
     
-    // Normal case: add the time since last activity to accumulated seconds
-    session.accumulated_seconds += time_since_last_activity;
+    session.accumulated_seconds + time_since_last
+}
+
+// Mutating: Finalize duration when stopping/saving lap (called rarely)
+fn finalize_lap_duration(session: &mut CurrentSession) -> u64 {
+    if session.is_paused {
+        return session.accumulated_seconds;
+    }
+    
+    let now = Instant::now();
+    let time_since_last = now.duration_since(session.last_activity_time).as_secs();
+    
+    // Exclude gaps > 5s (sleep/lock detection)
+    if time_since_last <= 5 {
+        session.accumulated_seconds += time_since_last;
+    }
     session.last_activity_time = now;
     
     session.accumulated_seconds
@@ -228,7 +236,7 @@ async fn end_day(state: State<'_, AppStateArc>, app_handle: AppHandle) -> Result
     
     // Calculate final duration for current lap (excluding sleep/hibernate time)
     let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let lap_duration = get_current_lap_duration(&mut session);
+    let lap_duration = finalize_lap_duration(&mut session);
     
     let result = if let Some(day_record) = records_guard.get_mut(&day_key) {
         // Update the last lap
@@ -266,7 +274,7 @@ async fn handle_screen_lock(state: State<'_, AppStateArc>) -> Result<String, Str
     
     if let Some(session) = session_guard.as_mut() {
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let lap_duration = get_current_lap_duration(session);
+        let lap_duration = finalize_lap_duration(session);
         
         // End current lap
         if let Some(day_record) = records_guard.get_mut(&session.day_key) {
@@ -342,17 +350,19 @@ async fn get_current_status(state: State<'_, AppStateArc>) -> Result<Option<Curr
             Ok(Some(CurrentStatus {
                 day_key: session.day_key.clone(),
                 current_lap_duration: 0, // No current lap when paused
+                current_lap_start_timestamp: session.current_lap_start_timestamp,
                 total_session_duration: total_duration, // Only completed laps
                 is_active: false, // Not actively tracking
             }))
         } else {
             // Session is active - include current lap time (excluding sleep/hibernate)
-            let current_lap_seconds = get_current_lap_duration(session);
+            let current_lap_seconds = calculate_display_lap_duration(session);
             let total_with_current_lap = total_duration + current_lap_seconds;
             
             Ok(Some(CurrentStatus {
                 day_key: session.day_key.clone(),
                 current_lap_duration: current_lap_seconds,
+                current_lap_start_timestamp: session.current_lap_start_timestamp,
                 total_session_duration: total_with_current_lap,
                 is_active: true,
             }))
@@ -366,6 +376,7 @@ async fn get_current_status(state: State<'_, AppStateArc>) -> Result<Option<Curr
 pub struct CurrentStatus {
     pub day_key: String,
     pub current_lap_duration: u64,
+    pub current_lap_start_timestamp: u64, // For frontend smooth display
     pub total_session_duration: u64,
     pub is_active: bool,
 }
@@ -395,7 +406,7 @@ async fn add_lap(state: State<'_, AppStateArc>) -> Result<String, String> {
     if let Some(session) = session_guard.as_mut() {
         let now = Instant::now();
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let lap_duration = get_current_lap_duration(session);
+        let lap_duration = finalize_lap_duration(session);
         
         // End current lap only if it has been running for more than 1 second
         if let Some(day_record) = records_guard.get_mut(&session.day_key) {
@@ -438,7 +449,7 @@ async fn stop_lap(state: State<'_, AppStateArc>) -> Result<String, String> {
         }
         
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let lap_duration = get_current_lap_duration(session);
+        let lap_duration = finalize_lap_duration(session);
         
         // If lap is very short (< 3 seconds), remove it instead of keeping it
         if lap_duration < 3 {
@@ -536,7 +547,7 @@ async fn handle_system_sleep(state: State<'_, AppStateArc>) -> Result<String, St
     
     if let Some(session) = session_guard.as_mut() {
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let lap_duration = get_current_lap_duration(session);
+        let lap_duration = finalize_lap_duration(session);
         
         // End current lap
         if let Some(day_record) = records_guard.get_mut(&session.day_key) {
@@ -593,7 +604,7 @@ async fn handle_user_logout(state: State<'_, AppStateArc>) -> Result<String, Str
     
     if let Some(session) = session_guard.as_mut() {
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let lap_duration = get_current_lap_duration(session);
+        let lap_duration = finalize_lap_duration(session);
         
         // End current lap
         if let Some(day_record) = records_guard.get_mut(&session.day_key) {
@@ -710,7 +721,7 @@ fn handle_screen_lock_direct(app_handle: &AppHandle, state: &AppStateArc) {
     
     if let Some(session) = session_guard.as_mut() {
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let lap_duration = get_current_lap_duration(session);
+        let lap_duration = finalize_lap_duration(session);
         
         // End current lap
         if let Some(day_record) = records_guard.get_mut(&session.day_key) {
@@ -782,7 +793,7 @@ fn handle_system_sleep_direct(app_handle: &AppHandle, state: &AppStateArc) {
     
     if let Some(session) = session_guard.as_mut() {
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let lap_duration = get_current_lap_duration(session);
+        let lap_duration = finalize_lap_duration(session);
         
         // End current lap
         if let Some(day_record) = records_guard.get_mut(&session.day_key) {
