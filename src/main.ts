@@ -141,7 +141,6 @@ class ScreenTimeTracker {
     try {
       const result = await invoke<string>('test_screen_lock_detection');
       this.showNotification(`Lock Detection Test:\n${result}`, 'success');
-      console.log('Lock detection test:', result);
     } catch (error) {
       this.showNotification(`Failed to test lock detection: ${error}`, 'error');
     }
@@ -151,7 +150,6 @@ class ScreenTimeTracker {
     try {
       const result = await invoke<string>('handle_screen_lock');
       this.showNotification(`Simulated Lock: ${result}`, 'success');
-      console.log('Simulated lock:', result);
       await this.loadCurrentStatus();
     } catch (error) {
       this.showNotification(`Failed to simulate lock: ${error}`, 'error');
@@ -162,7 +160,6 @@ class ScreenTimeTracker {
     try {
       const result = await invoke<string>('handle_screen_unlock');
       this.showNotification(`Simulated Unlock: ${result}`, 'success');
-      console.log('Simulated unlock:', result);
       await this.loadCurrentStatus();
     } catch (error) {
       this.showNotification(`Failed to simulate unlock: ${error}`, 'error');
@@ -174,6 +171,10 @@ class ScreenTimeTracker {
     try {
       const result = await invoke<string>('stop_lap');
       this.showNotification(result, 'success');
+
+      // Wait a bit for backend to update state
+      await new Promise(resolve => setTimeout(resolve, 100));
+
       await this.loadCurrentStatus();
 
       // Session is paused, not ended - just update button states
@@ -219,16 +220,14 @@ class ScreenTimeTracker {
 
     // Only show dynamic timers if there's an active session
     if (this.currentStatus && this.currentStatus.is_active) {
-      // Use backend's duration as base (already excludes gaps/sleep)
-      // Add sub-second precision for smooth counting
-      const backendDuration = this.currentStatus.current_lap_duration;
-      const currentTimeMs = Date.now();
-      const subSecondOffset = (currentTimeMs % 1000) / 1000; // 0.0 to 0.999
-      const smoothLapDuration = backendDuration + subSecondOffset;
+      // Calculate smooth frontend display (continues even when app is in background)
+      const currentTimeSeconds = Math.floor(Date.now() / 1000);
+      const lapDuration = currentTimeSeconds - this.currentStatus.current_lap_start_timestamp;
 
-      // Calculate completed laps total (exclude current lap from backend's total)
-      const completedLapsTotal = this.currentStatus.total_session_duration - this.currentStatus.current_lap_duration;
-      const smoothTotal = completedLapsTotal + smoothLapDuration;
+      // Backend's total_session_duration contains ONLY completed laps
+      // We add the current lap for smooth counting
+      const smoothLapDuration = lapDuration;
+      const smoothTotal = this.currentStatus.total_session_duration + smoothLapDuration;
 
       if (currentTimer) {
         currentTimer.textContent = this.formatTime(Math.floor(smoothLapDuration));

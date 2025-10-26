@@ -146,39 +146,19 @@ fn load_state(app_handle: &AppHandle, state: &AppStateArc) {
     }
 }
 
-// Read-only: Calculate display duration (called frequently for status)
-fn calculate_display_lap_duration(session: &CurrentSession) -> u64 {
-    if session.is_paused {
-        return session.accumulated_seconds;
-    }
-    
-    let now = Instant::now();
-    let time_since_last = now.duration_since(session.last_activity_time).as_secs();
-    
-    // If gap > 5s detected, don't include it in display
-    if time_since_last > 5 {
-        return session.accumulated_seconds;
-    }
-    
-    session.accumulated_seconds + time_since_last
+// Calculate lap duration from start timestamp (excludes sleep/lock time via event handlers)
+// Pass in the actual lap start time from records to ensure accuracy
+fn finalize_lap_duration(lap_start_time: u64) -> u64 {
+    let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    current_time - lap_start_time
 }
 
-// Mutating: Finalize duration when stopping/saving lap (called rarely)
-fn finalize_lap_duration(session: &mut CurrentSession) -> u64 {
-    if session.is_paused {
-        return session.accumulated_seconds;
-    }
-    
-    let now = Instant::now();
-    let time_since_last = now.duration_since(session.last_activity_time).as_secs();
-    
-    // Exclude gaps > 5s (sleep/lock detection)
-    if time_since_last <= 5 {
-        session.accumulated_seconds += time_since_last;
-    }
-    session.last_activity_time = now;
-    
-    session.accumulated_seconds
+// Get the actual start time of the active lap from records
+fn get_active_lap_start_time(day_record: &DayRecord) -> Option<u64> {
+    day_record.laps.iter()
+        .filter(|lap| lap.duration.is_none())
+        .last()
+        .map(|lap| lap.start_time)
 }
 
 #[tauri::command]
@@ -231,14 +211,18 @@ async fn end_day(state: State<'_, AppStateArc>, app_handle: AppHandle) -> Result
     let mut session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
     let mut records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
     
-    let mut session = session_guard.take().ok_or("No active session")?;
+    let session = session_guard.take().ok_or("No active session")?;
     let day_key = session.day_key.clone();
     
     // Calculate final duration for current lap (excluding sleep/hibernate time)
     let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let lap_duration = finalize_lap_duration(&mut session);
     
     let result = if let Some(day_record) = records_guard.get_mut(&day_key) {
+        // Get actual lap start time from records
+        let lap_start_time = get_active_lap_start_time(day_record)
+            .unwrap_or(session.current_lap_start_timestamp);
+        let lap_duration = finalize_lap_duration(lap_start_time);
+        
         // Update the last lap
         if let Some(last_lap) = day_record.laps.last_mut() {
             last_lap.end_time = Some(current_time);
@@ -273,8 +257,22 @@ async fn handle_screen_lock(state: State<'_, AppStateArc>) -> Result<String, Str
     let mut records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
     
     if let Some(session) = session_guard.as_mut() {
+        // Skip if already paused (prevent duplicate events)
+        if session.is_paused {
+            return Ok("Already paused".to_string());
+        }
+        
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let lap_duration = finalize_lap_duration(session);
+        
+        // Get actual lap start time from records
+        let lap_start_time = if let Some(day_record) = records_guard.get(&session.day_key) {
+            get_active_lap_start_time(day_record)
+                .unwrap_or(session.current_lap_start_timestamp)
+        } else {
+            session.current_lap_start_timestamp
+        };
+        
+        let lap_duration = finalize_lap_duration(lap_start_time);
         
         // End current lap
         if let Some(day_record) = records_guard.get_mut(&session.day_key) {
@@ -300,6 +298,11 @@ async fn handle_screen_unlock(state: State<'_, AppStateArc>) -> Result<String, S
     let mut records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
     
     if let Some(session) = session_guard.as_mut() {
+        // Skip if already active (prevent duplicate events)
+        if !session.is_paused {
+            return Ok("Already active".to_string());
+        }
+        
         // Only auto-start if user didn't manually pause
         if !session.user_paused {
             let now = Instant::now();
@@ -312,6 +315,7 @@ async fn handle_screen_unlock(state: State<'_, AppStateArc>) -> Result<String, S
                     end_time: None,
                     duration: None,
                 });
+                
             }
             
             // Reset lap tracking
@@ -355,15 +359,17 @@ async fn get_current_status(state: State<'_, AppStateArc>) -> Result<Option<Curr
                 is_active: false, // Not actively tracking
             }))
         } else {
-            // Session is active - include current lap time (excluding sleep/hibernate)
-            let current_lap_seconds = calculate_display_lap_duration(session);
-            let total_with_current_lap = total_duration + current_lap_seconds;
+            // Session is active - use session's current_lap_start_timestamp as source of truth
+            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let current_lap_seconds = current_time - session.current_lap_start_timestamp;
             
+            // IMPORTANT: total_session_duration should be ONLY completed laps
+            // Frontend will add current_lap_duration for smooth display
             Ok(Some(CurrentStatus {
                 day_key: session.day_key.clone(),
                 current_lap_duration: current_lap_seconds,
                 current_lap_start_timestamp: session.current_lap_start_timestamp,
-                total_session_duration: total_with_current_lap,
+                total_session_duration: total_duration, // Only completed laps, NOT including current lap
                 is_active: true,
             }))
         }
@@ -406,14 +412,19 @@ async fn add_lap(state: State<'_, AppStateArc>) -> Result<String, String> {
     if let Some(session) = session_guard.as_mut() {
         let now = Instant::now();
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let lap_duration = finalize_lap_duration(session);
         
-        // End current lap only if it has been running for more than 1 second
+        // Only finalize the last lap if it's still active (no duration set)
         if let Some(day_record) = records_guard.get_mut(&session.day_key) {
             if let Some(last_lap) = day_record.laps.last_mut() {
-                if lap_duration > 1 {
-                    last_lap.end_time = Some(current_time);
-                    last_lap.duration = Some(lap_duration);
+                // Only finalize if this lap is still active (duration is None)
+                if last_lap.duration.is_none() {
+                    let lap_start_time = last_lap.start_time;
+                    let lap_duration = finalize_lap_duration(lap_start_time);
+                    
+                    if lap_duration > 1 {
+                        last_lap.end_time = Some(current_time);
+                        last_lap.duration = Some(lap_duration);
+                    }
                 }
             }
             
@@ -423,6 +434,7 @@ async fn add_lap(state: State<'_, AppStateArc>) -> Result<String, String> {
                 end_time: None,
                 duration: None,
             });
+            
         }
         
         // Reset current lap tracking and resume session
@@ -449,7 +461,16 @@ async fn stop_lap(state: State<'_, AppStateArc>) -> Result<String, String> {
         }
         
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let lap_duration = finalize_lap_duration(session);
+        
+        // Get actual lap start time from records
+        let lap_start_time = if let Some(day_record) = records_guard.get(&session.day_key) {
+            get_active_lap_start_time(day_record)
+                .unwrap_or(session.current_lap_start_timestamp)
+        } else {
+            session.current_lap_start_timestamp
+        };
+        
+        let lap_duration = finalize_lap_duration(lap_start_time);
         
         // If lap is very short (< 3 seconds), remove it instead of keeping it
         if lap_duration < 3 {
@@ -465,7 +486,6 @@ async fn stop_lap(state: State<'_, AppStateArc>) -> Result<String, String> {
                         session.user_paused = true; // User manually paused
                         session.accumulated_seconds = 0;
                         
-                        println!("🗑️ Very short lap ({}s) removed - session paused by user", lap_duration);
                         return Ok("Very short lap removed - session paused".to_string());
                     }
                 }
@@ -478,7 +498,6 @@ async fn stop_lap(state: State<'_, AppStateArc>) -> Result<String, String> {
                 if last_lap.duration.is_none() {
                     last_lap.end_time = Some(current_time);
                     last_lap.duration = Some(lap_duration);
-                    println!("⏸️ Lap stopped ({}s) - session paused", lap_duration);
                 }
             }
         }
@@ -547,7 +566,16 @@ async fn handle_system_sleep(state: State<'_, AppStateArc>) -> Result<String, St
     
     if let Some(session) = session_guard.as_mut() {
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let lap_duration = finalize_lap_duration(session);
+        
+        // Get actual lap start time from records
+        let lap_start_time = if let Some(day_record) = records_guard.get(&session.day_key) {
+            get_active_lap_start_time(day_record)
+                .unwrap_or(session.current_lap_start_timestamp)
+        } else {
+            session.current_lap_start_timestamp
+        };
+        
+        let lap_duration = finalize_lap_duration(lap_start_time);
         
         // End current lap
         if let Some(day_record) = records_guard.get_mut(&session.day_key) {
@@ -582,6 +610,7 @@ async fn handle_system_wake(state: State<'_, AppStateArc>) -> Result<String, Str
                 end_time: None,
                 duration: None,
             });
+            
         }
         
         // Reset lap tracking
@@ -604,7 +633,16 @@ async fn handle_user_logout(state: State<'_, AppStateArc>) -> Result<String, Str
     
     if let Some(session) = session_guard.as_mut() {
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let lap_duration = finalize_lap_duration(session);
+        
+        // Get actual lap start time from records
+        let lap_start_time = if let Some(day_record) = records_guard.get(&session.day_key) {
+            get_active_lap_start_time(day_record)
+                .unwrap_or(session.current_lap_start_timestamp)
+        } else {
+            session.current_lap_start_timestamp
+        };
+        
+        let lap_duration = finalize_lap_duration(lap_start_time);
         
         // End current lap
         if let Some(day_record) = records_guard.get_mut(&session.day_key) {
@@ -639,6 +677,7 @@ async fn handle_user_login(state: State<'_, AppStateArc>) -> Result<String, Stri
                 end_time: None,
                 duration: None,
             });
+            
         }
         
         // Reset lap tracking
@@ -720,8 +759,22 @@ fn handle_screen_lock_direct(app_handle: &AppHandle, state: &AppStateArc) {
     let mut records_guard = state.day_records.lock().unwrap();
     
     if let Some(session) = session_guard.as_mut() {
+        // Skip if already paused (prevent duplicate events)
+        if session.is_paused {
+            return;
+        }
+        
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let lap_duration = finalize_lap_duration(session);
+        
+        // Get actual lap start time from records
+        let lap_start_time = if let Some(day_record) = records_guard.get(&session.day_key) {
+            get_active_lap_start_time(day_record)
+                .unwrap_or(session.current_lap_start_timestamp)
+        } else {
+            session.current_lap_start_timestamp
+        };
+        
+        let lap_duration = finalize_lap_duration(lap_start_time);
         
         // End current lap
         if let Some(day_record) = records_guard.get_mut(&session.day_key) {
@@ -734,8 +787,6 @@ fn handle_screen_lock_direct(app_handle: &AppHandle, state: &AppStateArc) {
         // Mark as paused by system (not user)
         session.is_paused = true;
         session.user_paused = false; // System paused, not user
-        
-        println!("🔒 Screen locked - lap paused (duration: {}s)", lap_duration);
     }
     
     // Release locks before saving
@@ -751,6 +802,11 @@ fn handle_screen_unlock_direct(app_handle: &AppHandle, state: &AppStateArc) {
     let mut records_guard = state.day_records.lock().unwrap();
     
     if let Some(session) = session_guard.as_mut() {
+        // Skip if already active (prevent duplicate events)
+        if !session.is_paused {
+            return;
+        }
+        
         // Only auto-start a new lap if user didn't manually pause
         // If user manually paused, respect their choice and don't auto-resume
         if !session.user_paused {
@@ -764,6 +820,7 @@ fn handle_screen_unlock_direct(app_handle: &AppHandle, state: &AppStateArc) {
                     end_time: None,
                     duration: None,
                 });
+                
             }
             
             // Reset lap tracking and resume
@@ -772,10 +829,6 @@ fn handle_screen_unlock_direct(app_handle: &AppHandle, state: &AppStateArc) {
             session.accumulated_seconds = 0;
             session.last_activity_time = now;
             session.is_paused = false; // Resume active tracking
-            
-            println!("🔓 Screen unlocked - new lap auto-started");
-        } else {
-            println!("🔓 Screen unlocked - session remains paused (user paused manually)");
         }
     }
     
@@ -792,8 +845,22 @@ fn handle_system_sleep_direct(app_handle: &AppHandle, state: &AppStateArc) {
     let mut records_guard = state.day_records.lock().unwrap();
     
     if let Some(session) = session_guard.as_mut() {
+        // Skip if already paused (prevent duplicate events)
+        if session.is_paused {
+            return;
+        }
+        
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let lap_duration = finalize_lap_duration(session);
+        
+        // Get actual lap start time from records
+        let lap_start_time = if let Some(day_record) = records_guard.get(&session.day_key) {
+            get_active_lap_start_time(day_record)
+                .unwrap_or(session.current_lap_start_timestamp)
+        } else {
+            session.current_lap_start_timestamp
+        };
+        
+        let lap_duration = finalize_lap_duration(lap_start_time);
         
         // End current lap
         if let Some(day_record) = records_guard.get_mut(&session.day_key) {
@@ -806,8 +873,6 @@ fn handle_system_sleep_direct(app_handle: &AppHandle, state: &AppStateArc) {
         // Mark session as paused by system (not user)
         session.is_paused = true;
         session.user_paused = false; // System paused, not user
-        
-        println!("💤 System sleep detected - lap paused (duration: {}s)", lap_duration);
     }
     
     // Release locks before saving
@@ -823,6 +888,11 @@ fn handle_system_wake_direct(app_handle: &AppHandle, state: &AppStateArc) {
     let mut records_guard = state.day_records.lock().unwrap();
     
     if let Some(session) = session_guard.as_mut() {
+        // Skip if already active (prevent duplicate events)
+        if !session.is_paused {
+            return;
+        }
+        
         // Only auto-start if user didn't manually pause
         if !session.user_paused {
             let now = Instant::now();
@@ -835,6 +905,7 @@ fn handle_system_wake_direct(app_handle: &AppHandle, state: &AppStateArc) {
                     end_time: None,
                     duration: None,
                 });
+                
             }
             
             // Reset lap tracking and resume
@@ -843,10 +914,6 @@ fn handle_system_wake_direct(app_handle: &AppHandle, state: &AppStateArc) {
             session.accumulated_seconds = 0;
             session.last_activity_time = now;
             session.is_paused = false; // Resume the session
-            
-            println!("⏰ System wake detected - new lap auto-started");
-        } else {
-            println!("⏰ System wake - session remains paused (user paused manually)");
         }
     }
     
