@@ -1049,12 +1049,130 @@ fn check_system_sleep_state() -> Result<bool, String> {
     Ok(output_str.is_empty() || output_str.contains("sleep"))
 }
 
+// Get system uptime in seconds (macOS)
+#[cfg(target_os = "macos")]
+fn get_system_uptime() -> Result<u64, String> {
+    let output = Command::new("sysctl")
+        .arg("-n")
+        .arg("kern.boottime")
+        .output()
+        .map_err(|e| e.to_string())?;
+    
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    // Parse boot time from output like: { sec = 1234567890, usec = 0 }
+    if let Some(sec_str) = output_str.split("sec = ").nth(1) {
+        if let Some(boot_time_str) = sec_str.split(',').next() {
+            if let Ok(boot_time) = boot_time_str.trim().parse::<u64>() {
+                let current_time = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                return Ok(current_time - boot_time);
+            }
+        }
+    }
+    
+    Err("Failed to parse system uptime".to_string())
+}
+
+// Check if we should show startup notification
+fn should_show_startup_notification(state: &AppStateArc) -> Result<bool, String> {
+    // Check if system was recently started (within last 10 minutes)
+    #[cfg(target_os = "macos")]
+    {
+        let uptime = get_system_uptime()?;
+        if uptime > 600 {
+            // System has been running for more than 10 minutes, not a fresh startup
+            return Ok(false);
+        }
+    }
+    
+    let session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
+    
+    // Check if we have a paused session (user had started before but no active lap)
+    if let Some(session) = session_guard.as_ref() {
+        if session.is_paused {
+            // We have a paused session, should notify
+            return Ok(true);
+        }
+    }
+    
+    Ok(false)
+}
+
+// Show startup notification to user
+fn show_startup_notification(app_handle: &AppHandle) {
+    use tauri_plugin_notification::NotificationExt;
+    
+    println!("🔔 Showing startup notification to user");
+    
+    let notification = app_handle
+        .notification()
+        .builder()
+        .title("Screen Time Tracker")
+        .body("Welcome back! Would you like to start tracking your screen time today?")
+        .show();
+    
+    match notification {
+        Ok(_) => println!("✅ Startup notification shown successfully"),
+        Err(e) => eprintln!("❌ Failed to show notification: {}", e),
+    }
+}
+
+// Check and notify on startup
+fn check_and_notify_on_startup(app_handle: &AppHandle, state: &AppStateArc) {
+    // Wait a bit for the system to settle after startup
+    thread::sleep(Duration::from_secs(3));
+    
+    match should_show_startup_notification(state) {
+        Ok(should_notify) => {
+            if should_notify {
+                show_startup_notification(app_handle);
+            } else {
+                println!("ℹ️ No need to show startup notification");
+            }
+        }
+        Err(e) => {
+            eprintln!("❌ Error checking startup notification: {}", e);
+        }
+    }
+}
+
+// Tauri command to start day from notification
+#[tauri::command]
+async fn start_day_from_notification(state: State<'_, AppStateArc>) -> Result<String, String> {
+    // Check if already has an active session
+    let should_add_lap = {
+        let session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
+        
+        if let Some(session) = session_guard.as_ref() {
+            if session.is_paused {
+                // We have a paused session, just add a new lap to resume
+                true
+            } else {
+                // Already actively tracking
+                return Ok("Already tracking".to_string());
+            }
+        } else {
+            // No session, start a new day
+            false
+        }
+    }; // Drop the lock here before awaiting
+    
+    if should_add_lap {
+        add_lap(state).await
+    } else {
+        start_day(state).await
+    }
+}
+
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = Arc::new(AppState::new());
     
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .manage(app_state.clone())
         .invoke_handler(tauri::generate_handler![
             start_day,
@@ -1070,13 +1188,21 @@ pub fn run() {
             handle_system_sleep,
             handle_system_wake,
             handle_user_logout,
-            handle_user_login
+            handle_user_login,
+            start_day_from_notification
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();
             
             // Load saved state from disk
             load_state(&app_handle, &app_state);
+            
+            // Check if we should show startup notification (after system restart)
+            let state_for_notification = app_state.clone();
+            let handle_for_notification = app_handle.clone();
+            thread::spawn(move || {
+                check_and_notify_on_startup(&handle_for_notification, &state_for_notification);
+            });
             
             // Start system monitoring when app starts
             start_system_monitoring(app_handle.clone(), app_state.clone());

@@ -41,12 +41,6 @@ class ScreenTimeTracker {
         <header class="header">
           <h1>🕒 Screen Time Tracker</h1>
           <p class="subtitle">Track your daily screen time with automatic lap management</p>
-          <div class="auto-features">
-            <div class="feature-item">🔒 Auto-pause on screen lock</div>
-            <div class="feature-item">💤 Auto-pause on sleep/hibernate</div>
-            <div class="feature-item">👤 Auto-pause on logout</div>
-            <div class="feature-item">▶️ Auto-resume on unlock/wake/login</div>
-          </div>
         </header>
 
         <main class="main-content">
@@ -405,6 +399,25 @@ class ScreenTimeTracker {
 
     // Add event listeners for system events that might be detected by the frontend
     this.setupSystemEventListeners();
+
+    // Setup notification click handler for startup notifications
+    this.setupNotificationHandler();
+  }
+
+  private setupNotificationHandler(): void {
+    // Listen for notification clicks (when user clicks "Start tracking" notification)
+    // The notification plugin emits events we can listen to
+    window.addEventListener('notification-clicked', async () => {
+      console.log('Notification clicked - starting day from notification');
+      try {
+        await invoke('start_day_from_notification');
+        this.showNotification('Tracking started!', 'success');
+        await this.loadCurrentStatus();
+      } catch (error) {
+        console.error('Failed to start day from notification:', error);
+        this.showNotification(`Failed to start tracking: ${error}`, 'error');
+      }
+    });
   }
 
   private setupSystemEventListeners(): void {
