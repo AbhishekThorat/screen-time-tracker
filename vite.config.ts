@@ -8,6 +8,17 @@ export default defineConfig(async () => ({
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
+  // Multi-page build: the full UI (index.html) and the compact menu-bar popover
+  // (popover.html) are separate entry points / windows.
+  build: {
+    rollupOptions: {
+      // Paths are relative to the Vite root (project directory).
+      input: {
+        main: "index.html",
+        popover: "popover.html",
+      },
+    },
+  },
   // 1. prevent vite from obscuring rust errors
   clearScreen: false,
   // 2. tauri expects a fixed port, fail if that port is not available

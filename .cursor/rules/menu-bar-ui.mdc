@@ -1,0 +1,53 @@
+---
+description: The menu-bar (tray) app architecture — tray icon, on-demand popover and full windows, window lifecycle, and the low-idle-memory rationale. Read before touching the tray/window code in lib.rs or the popover frontend.
+globs: src-tauri/src/lib.rs,src/popover.ts,src/popover.css,popover.html,vite.config.ts
+alwaysApply: false
+---
+
+# Menu-bar (tray) app
+
+The app is a macOS **menu-bar app** (no Dock icon). This is the primary reason idle
+memory/CPU is low: **no window is created at startup**, so no webview process runs until
+the user opens one.
+
+## Windows are created on demand (and destroyed on close)
+
+- `tauri.conf.json` has `"windows": []` — nothing auto-opens. The app is set to
+  `ActivationPolicy::Accessory` in `setup` (no Dock icon).
+- Two window labels, both built lazily via `WebviewWindowBuilder`:
+  - **`popover`** (`popover.html` / `src/popover.ts`) — a small, borderless, always-on-top
+    quick-glance window: current lap + today's total, Pause/Resume, New Lap, and Expand.
+    Built by `toggle_popover()` on left-click of the tray, positioned under the icon, and
+    it **closes itself on blur** (`WindowEvent::Focused(false)`).
+  - **`main`** (`index.html` / `src/main.ts`) — the full UI (laps + history). Built by
+    `open_main_window()` from the popover's Expand button or the tray's Open menu item.
+- Closing a window destroys its webview, reclaiming memory. Reopening rebuilds it.
+- Because all windows can be closed, the app must NOT quit when the last one closes:
+  `run()` uses `.build().run(|_, event| { if ExitRequested { api.prevent_exit() } })`.
+  The only real quit path is the tray menu's **Quit** item (`app.exit(0)`).
+
+## Tray
+
+- Built in `setup` with `TrayIconBuilder` (id `"tray"`), icon from `icons/32x32.png`.
+- Left click → `toggle_popover()` (via `on_tray_icon_event`, filtered to
+  `MouseButton::Left` + `MouseButtonState::Up`). `show_menu_on_left_click(false)` so the
+  left click doesn't open the right-click menu.
+- Right-click menu (`on_menu_event`): `open` → `open_main_window`, `quit` → `app.exit(0)`.
+- Requires `tauri = { features = ["tray-icon", "image-png"] }` and both window labels listed
+  in `capabilities/default.json` (`"windows": ["main", "popover"]`).
+
+## The timer is on-demand, never a background counter
+
+- There is **no always-running timer**. Elapsed time is derived from stored timestamps
+  (`now - current_lap_start_timestamp`) and only computed while a window is open and
+  polling (popover polls every 1s, full window every 200ms). Close the window and the
+  polling stops with the webview.
+- Lock/sleep detection threads DO run continuously — that is deliberate and required:
+  they finalize the current lap on lock/sleep and start a new one on unlock/wake, which is
+  what makes "now - start" accurate (locked/asleep/off time is excluded, not counted).
+
+## Multi-page frontend
+
+- `vite.config.ts` declares two entry points: `index.html` (main) and `popover.html`.
+- Keep `popover.ts` minimal — it's a glance view. Rich detail/history belongs in the full
+  window (`main.ts`). Both share the `CurrentStatus` shape from the backend.

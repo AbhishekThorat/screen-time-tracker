@@ -1,0 +1,123 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  background: transparent;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#popover {
+  padding: 8px;
+}
+
+.pop-card {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  border-radius: 14px;
+  padding: 18px 16px 14px;
+  color: white;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+  text-align: center;
+}
+
+.pop-stats {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.pop-stat {
+  flex: 1;
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  padding: 8px 6px 9px;
+}
+
+.pop-stat-label {
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.8;
+  font-weight: 600;
+  margin-bottom: 3px;
+}
+
+.pop-stat-value {
+  font-family: "Courier New", monospace;
+  font-size: 1.35rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  line-height: 1.1;
+  text-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+}
+
+.pop-status {
+  font-size: 0.75rem;
+  opacity: 0.85;
+  margin-bottom: 12px;
+  font-weight: 500;
+}
+
+.pop-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.pop-btn {
+  flex: 1;
+  padding: 9px 10px;
+  border: none;
+  border-radius: 9px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  color: white;
+  background: rgba(255, 255, 255, 0.18);
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+
+.pop-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.28);
+}
+
+.pop-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.pop-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.pop-btn-primary {
+  background: rgba(255, 255, 255, 0.95);
+  color: #5b4b9e;
+}
+
+.pop-btn-primary:hover:not(:disabled) {
+  background: white;
+}
+
+.pop-expand {
+  width: 100%;
+  padding: 8px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 0.8rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.pop-expand:hover {
+  background: rgba(255, 255, 255, 0.15);
+}

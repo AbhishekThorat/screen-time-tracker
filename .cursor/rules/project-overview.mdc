@@ -13,7 +13,11 @@ per calendar day. All data is stored **locally** on the user's machine.
 ## Tech stack
 
 - **Backend**: Rust + Tauri 2 (`src-tauri/src/lib.rs` is the core; `main.rs` is the entry point)
-- **Frontend**: Vanilla TypeScript + Vite (`src/main.ts`, `src/styles.css`), no UI framework
+- **Frontend**: Vanilla TypeScript + Vite, no UI framework. Two entry points: the full
+  window (`src/main.ts` + `src/styles.css`) and the menu-bar popover (`src/popover.ts` +
+  `src/popover.css`). See [[menu-bar-ui]] for the tray/window architecture.
+- **App shape**: macOS **menu-bar app** (no Dock icon); windows are created on demand and
+  destroyed on close so no webview runs while idle
 - **Persistence**: JSON file at `~/Library/Application Support/screen-time/state.json`
 - **Key crates**: `serde`/`serde_json`, `chrono`, `tokio`, `cocoa` + `objc` (native macOS),
   `tauri-plugin-notification`, `tauri-plugin-autostart`

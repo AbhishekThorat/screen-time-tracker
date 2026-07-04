@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tauri::{State, AppHandle, Manager};
+use tauri::{State, AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -1320,6 +1322,103 @@ fn check_and_notify_on_startup(app_handle: &AppHandle, state: &AppStateArc) {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Menu-bar (tray) app: the app lives in the macOS menu bar. Left-clicking the
+// tray icon toggles a small popover (quick glance + basic controls); the popover
+// can expand to the full window. Keeping the full webview closed by default is
+// what keeps idle memory/CPU low — no webview process runs until you open one.
+// ----------------------------------------------------------------------------
+
+// Convert a tray icon rectangle into physical (x, y, width, height).
+fn rect_to_physical(rect: &tauri::Rect) -> (f64, f64, f64, f64) {
+    let (x, y) = match rect.position {
+        tauri::Position::Physical(p) => (p.x as f64, p.y as f64),
+        tauri::Position::Logical(p) => (p.x, p.y),
+    };
+    let (w, h) = match rect.size {
+        tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
+        tauri::Size::Logical(s) => (s.width, s.height),
+    };
+    (x, y, w, h)
+}
+
+// Toggle the popover: close it if open, otherwise build a small borderless window
+// anchored under the tray icon and show it. It closes itself when it loses focus.
+fn toggle_popover(app: &AppHandle, rect: tauri::Rect) {
+    if let Some(existing) = app.get_webview_window("popover") {
+        let _ = existing.close();
+        return;
+    }
+
+    let width = 288.0;
+    let height = 214.0;
+
+    let win = match WebviewWindowBuilder::new(app, "popover", WebviewUrl::App("popover.html".into()))
+        .inner_size(width, height)
+        .decorations(false)
+        .always_on_top(true)
+        .resizable(false)
+        .skip_taskbar(true)
+        .visible(false)
+        .build()
+    {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("❌ Failed to build popover window: {}", e);
+            return;
+        }
+    };
+
+    // Anchor the popover horizontally centered under the tray icon.
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let (ix, iy, iw, ih) = rect_to_physical(&rect);
+    let px = (ix + iw / 2.0 - (width * scale) / 2.0).max(0.0);
+    let py = iy + ih + 2.0;
+    let _ = win.set_position(tauri::PhysicalPosition::new(px, py));
+    let _ = win.show();
+    let _ = win.set_focus();
+
+    // Dismiss when the user clicks away (popover loses focus).
+    let win_for_event = win.clone();
+    win.on_window_event(move |event| {
+        if let WindowEvent::Focused(false) = event {
+            let _ = win_for_event.close();
+        }
+    });
+}
+
+// Show (or create) the full UI window and close the popover. The full window is
+// created on demand so no webview exists while the app sits in the menu bar.
+fn open_main_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    } else {
+        match WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+            .title("Screen Time Tracker")
+            .inner_size(1000.0, 800.0)
+            .min_inner_size(800.0, 600.0)
+            .resizable(true)
+            .build()
+        {
+            Ok(_) => println!("✅ Opened full window"),
+            Err(e) => eprintln!("❌ Failed to build main window: {}", e),
+        }
+    }
+
+    if let Some(p) = app.get_webview_window("popover") {
+        let _ = p.close();
+    }
+}
+
+// Expand from the popover to the full window.
+#[tauri::command]
+async fn show_main_window(app: AppHandle) -> Result<(), String> {
+    open_main_window(&app);
+    Ok(())
+}
+
 // Tauri command to start day from notification
 #[tauri::command]
 async fn start_day_from_notification(state: State<'_, AppStateArc>) -> Result<String, String> {
@@ -1376,10 +1475,45 @@ pub fn run() {
             handle_system_wake,
             handle_user_logout,
             handle_user_login,
-            start_day_from_notification
+            start_day_from_notification,
+            show_main_window
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();
+
+            // Run as a menu-bar (accessory) app: no Dock icon, lives in the menu bar.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            // Build the menu-bar tray icon. Left click toggles the popover; a right-click
+            // menu provides Open (full window) and Quit.
+            {
+                let open_item = MenuItemBuilder::with_id("open", "Open Screen Time Tracker").build(app)?;
+                let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+                let tray_menu = MenuBuilder::new(app).items(&[&open_item, &quit_item]).build()?;
+
+                let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))
+                    .expect("failed to load tray icon");
+
+                TrayIconBuilder::with_id("tray")
+                    .icon(tray_icon)
+                    .tooltip("Screen Time Tracker")
+                    .menu(&tray_menu)
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(|app, event| match event.id().as_ref() {
+                        "open" => open_main_window(app),
+                        "quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let TrayIconEvent::Click { button, button_state, rect, .. } = event {
+                            if button == MouseButton::Left && button_state == MouseButtonState::Up {
+                                toggle_popover(tray.app_handle(), rect);
+                            }
+                        }
+                    })
+                    .build(app)?;
+            }
 
             // Ensure the app launches automatically when the user logs into the machine.
             {
@@ -1420,6 +1554,13 @@ pub fn run() {
             
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            // The app is a menu-bar app: keep it running even when all windows are
+            // closed. It only quits via the tray's Quit item (app.exit).
+            if let RunEvent::ExitRequested { api, .. } = event {
+                api.prevent_exit();
+            }
+        });
 }

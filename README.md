@@ -1,9 +1,12 @@
 # Screen Time Tracker
 
-A Tauri-based desktop application for tracking screen time with automatic pause/resume when the screen is locked/unlocked. It launches automatically at login, manages your work day around machine power events, and keeps a full local history of every day you've tracked.
+A lightweight macOS **menu-bar** application for tracking screen time with automatic pause/resume when the screen is locked/unlocked. It lives in the menu bar, launches automatically at login, manages your work day around machine power events, and keeps a full local history of every day you've tracked.
 
 ## Features
 
+- **Menu-bar app**: Lives in the macOS menu bar with no Dock icon. Click the icon for a compact popover; expand to the full window only when you want details
+- **Low footprint**: No window is open by default, so **no webview process runs while idle** (~30 MB vs ~150 MB for an always-open window). The timer isn't an always-running counter — elapsed time is computed on demand from timestamps only while a popover/window is open
+- **Quick-glance popover**: Shows **current lap** and **today's total** side by side, plus Pause/Resume and New Lap; an "Expand full window" button opens the detailed view
 - **Real-time Timer**: Track your daily screen time with a live timer
 - **Automatic Pause/Resume**: Timer automatically pauses when screen is locked and resumes with a new lap when unlocked
 - **Launch at Login**: The app registers itself to start automatically whenever you start your machine
@@ -16,14 +19,15 @@ A Tauri-based desktop application for tracking screen time with automatic pause/
 
 ## How It Works
 
-1. **Autostart**: The app launches at login and automatically starts your day in the background. If you're not working yet, open it and pause.
-2. **Automatic Monitoring**: It monitors screen lock/unlock and sleep/wake events, pausing and resuming tracking accordingly.
-3. **Lap Creation**: Each time you lock/unlock (or resume), a new lap is created within the current day.
-4. **Day Lifecycle**:
+1. **Autostart**: The app launches at login (into the menu bar) and automatically starts your day in the background. If you're not working yet, click the menu-bar icon and press Pause.
+2. **Menu bar**: Click the icon for the quick-glance popover (current lap + today's total, Pause/Resume, New Lap). Use **Expand full window** for laps and history. Right-click the icon for Open / Quit.
+3. **Automatic Monitoring**: It monitors screen lock/unlock and sleep/wake events, pausing and resuming tracking accordingly.
+4. **Lap Creation**: Each time you lock/unlock (or resume), a new lap is created within the current day.
+5. **Day Lifecycle**:
    - **Shutdown** ends your day; the **next day's boot** starts a fresh day.
    - A **restart on the same day** (e.g. electricity cut) continues your existing day, adding a new lap.
    - Working **past midnight** in one sitting keeps the credit on the day you started.
-5. **History**: Browse all past days and their laps in the History section, or click **End Day** to finalize the current day early.
+6. **History**: Browse all past days and their laps in the History section, or click **End Day** to finalize the current day early.
 
 ## Technology Stack
 
@@ -32,6 +36,7 @@ A Tauri-based desktop application for tracking screen time with automatic pause/
 - **UI Framework**: Vanilla TypeScript with modern CSS
 - **Data Storage**: Local JSON persistence (`state.json` in the app data directory), retaining full per-day history
 - **Autostart**: `tauri-plugin-autostart` (launch on login)
+- **Menu bar**: Tauri tray icon + on-demand popover / full windows (created when opened, destroyed when closed to keep idle memory low)
 
 ## Development
 
