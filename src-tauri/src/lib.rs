@@ -924,7 +924,10 @@ fn start_system_monitoring(app_handle: AppHandle, state: AppStateArc) {
                 Err(e) => eprintln!("Error checking system sleep state: {}", e),
             }
             
-            thread::sleep(Duration::from_millis(500)); // Check every 500ms for more responsive detection
+            // Poll once per second. Sub-second lock/sleep latency isn't needed for a time
+            // tracker (a ~1s error at a lap boundary is negligible), and 1s halves the
+            // subprocess spawns vs. the old 500ms.
+            thread::sleep(Duration::from_millis(1000));
         }
     });
 }
@@ -1114,47 +1117,6 @@ fn check_screen_lock_state_sync() -> Result<bool, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn start_macos_screen_lock_monitoring(app_handle: AppHandle, state: AppStateArc) {
-    thread::spawn(move || {
-        let mut last_screen_lock_state = false;
-        let mut lock_detection_count = 0;
-        let mut unlock_detection_count = 0;
-        
-        loop {
-            // Check for screen lock using a more reliable method
-            match check_macos_screen_lock_state() {
-                Ok(is_locked) => {
-                    // Debounce: require 2 consecutive detections before changing state
-                    if is_locked {
-                        lock_detection_count += 1;
-                        unlock_detection_count = 0;
-                    } else {
-                        unlock_detection_count += 1;
-                        lock_detection_count = 0;
-                    }
-                    
-                    // Only change state after 2 consecutive detections
-                    if is_locked && lock_detection_count >= 2 && !last_screen_lock_state {
-                        println!("🔒 macOS Screen lock detected!");
-                        handle_screen_lock_direct(&app_handle, &state);
-                        last_screen_lock_state = true;
-                    } else if !is_locked && unlock_detection_count >= 2 && last_screen_lock_state {
-                        println!("🔓 macOS Screen unlock detected!");
-                        handle_screen_unlock_direct(&app_handle, &state);
-                        last_screen_lock_state = false;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("❌ Error checking screen lock state: {}", e);
-                }
-            }
-            
-            thread::sleep(Duration::from_millis(500));
-        }
-    });
-}
-
-#[cfg(target_os = "macos")]
 fn check_macos_screen_lock_state() -> Result<bool, String> {
     // Method 1: Use native Cocoa/Objective-C to check session state
     unsafe {
@@ -1192,22 +1154,11 @@ fn check_macos_screen_lock_state() -> Result<bool, String> {
     if !screensaver_output.stdout.is_empty() {
         return Ok(true);
     }
-    
-    // Method 3: Use AppleScript to check frontmost process (more reliable)
-    let script_output = Command::new("osascript")
-        .arg("-e")
-        .arg("tell application \"System Events\" to get name of first process whose frontmost is true")
-        .output()
-        .map_err(|e| e.to_string())?;
-    
-    if script_output.status.success() {
-        let frontmost = String::from_utf8_lossy(&script_output.stdout);
-        let frontmost_trimmed = frontmost.trim();
-        if frontmost_trimmed == "loginwindow" || frontmost_trimmed == "ScreenSaverEngine" {
-            return Ok(true);
-        }
-    }
-    
+
+    // Methods 1 (native NSWorkspace) and 2 (pgrep) above are sufficient to detect a
+    // locked screen. We intentionally do NOT shell out to `osascript` here: this runs
+    // on every poll while UNLOCKED (the common case), and an AppleScript spawn each
+    // cycle was the single biggest source of idle CPU.
     Ok(false)
 }
 
@@ -1535,13 +1486,11 @@ pub fn run() {
                 check_and_notify_on_startup(&handle_for_notification, &state_for_notification);
             });
             
-            // Start system monitoring when app starts
+            // Start system monitoring when app starts. This single thread handles both
+            // screen lock/unlock and sleep/wake detection (previously a second, redundant
+            // macOS-only lock-detection thread ran in parallel — removed to cut idle CPU).
             start_system_monitoring(app_handle.clone(), app_state.clone());
-            
-            // Start macOS-specific screen lock monitoring
-            #[cfg(target_os = "macos")]
-            start_macos_screen_lock_monitoring(app_handle.clone(), app_state.clone());
-            
+
             // Start periodic state saving (every 30 seconds)
             let state_for_autosave = app_state.clone();
             let handle_for_autosave = app_handle.clone();
