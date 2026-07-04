@@ -29,6 +29,7 @@ class ScreenTimeTracker {
     this.initializeUI();
     this.setupEventListeners();
     this.startStatusUpdates();
+    this.startHistoryUpdates();
     this.startScreenLockMonitoring();
   }
 
@@ -76,6 +77,17 @@ class ScreenTimeTracker {
               <button id="end-day-btn" class="btn btn-secondary" disabled>End Day</button>
             </div>
           </section>
+
+          <!-- History Section: all recorded days -->
+          <section class="history-section">
+            <div class="history-header">
+              <h3>📅 History</h3>
+              <span class="history-subtitle" id="history-summary"></span>
+            </div>
+            <div class="history-list" id="history-list">
+              <div class="empty-history">No history yet</div>
+            </div>
+          </section>
         </main>
       </div>
     `;
@@ -116,6 +128,7 @@ class ScreenTimeTracker {
       this.updateButtonStates();
       this.showNotification(`Day ended! Total time: ${this.formatTime(dayRecord.total_duration)}`, 'success');
       this.hideLapsSection();
+      await this.loadHistory();
     } catch (error) {
       this.showNotification(`Failed to end day: ${error}`, 'error');
     }
@@ -389,6 +402,124 @@ class ScreenTimeTracker {
     if (lapsSection) {
       lapsSection.style.display = 'none';
     }
+  }
+
+  private startHistoryUpdates(): void {
+    // History changes far less often than the live timer, so poll it slowly.
+    this.loadHistory();
+    window.setInterval(() => this.loadHistory(), 5000);
+  }
+
+  private async loadHistory(): Promise<void> {
+    try {
+      const records = await invoke<DayRecord[]>('get_all_day_records');
+      this.displayHistory(records);
+    } catch (error) {
+      console.error('Failed to load history:', error);
+    }
+  }
+
+  private displayHistory(records: DayRecord[]): void {
+    const historyList = document.getElementById('history-list');
+    const summary = document.getElementById('history-summary');
+    if (!historyList) return;
+
+    if (!records || records.length === 0) {
+      historyList.innerHTML = '<div class="empty-history">No history yet</div>';
+      if (summary) summary.textContent = '';
+      return;
+    }
+
+    const grandTotal = records.reduce((sum, r) => sum + (r.total_duration || 0), 0);
+    if (summary) {
+      summary.textContent = `${records.length} day${records.length > 1 ? 's' : ''} · ${this.formatTime(grandTotal)} total`;
+    }
+
+    historyList.innerHTML = records.map(record => this.renderHistoryDay(record)).join('');
+
+    // Wire up expand/collapse toggles for each day.
+    historyList.querySelectorAll('.history-day-header').forEach(header => {
+      header.addEventListener('click', () => {
+        const day = header.closest('.history-day');
+        day?.classList.toggle('expanded');
+      });
+    });
+  }
+
+  private renderHistoryDay(record: DayRecord): string {
+    const completedLaps = record.laps.filter(
+      lap => lap.duration !== undefined && lap.duration !== null && lap.duration > 0
+    );
+
+    const dateLabel = this.formatDateLabel(record.date);
+    const statusBadge = record.is_active
+      ? '<span class="history-badge active">Active</span>'
+      : '';
+
+    const lapsHtml = record.laps.length === 0
+      ? '<div class="empty-laps">No laps recorded</div>'
+      : record.laps.map((lap, index) => {
+          const startTime = new Date(lap.start_time * 1000);
+          const endTime = lap.end_time ? new Date(lap.end_time * 1000) : null;
+          const isOngoing = lap.duration === undefined || lap.duration === null;
+          const durationText = isOngoing ? 'Ongoing' : this.formatTime(lap.duration || 0);
+          return `
+            <div class="history-lap ${isOngoing ? 'ongoing' : ''}">
+              <span class="history-lap-num">Lap ${index + 1}</span>
+              <span class="history-lap-period">${startTime.toLocaleTimeString()} - ${endTime ? endTime.toLocaleTimeString() : 'Ongoing'}</span>
+              <span class="history-lap-duration">${durationText}</span>
+            </div>
+          `;
+        }).join('');
+
+    return `
+      <div class="history-day">
+        <div class="history-day-header">
+          <div class="history-day-title">
+            <span class="history-day-date">${dateLabel}</span>
+            ${statusBadge}
+          </div>
+          <div class="history-day-meta">
+            <span class="history-day-total">${this.formatTime(record.total_duration || 0)}</span>
+            <span class="history-day-laps">${completedLaps.length} lap${completedLaps.length === 1 ? '' : 's'}</span>
+            <span class="history-chevron">▾</span>
+          </div>
+        </div>
+        <div class="history-day-laps-list">
+          ${lapsHtml}
+        </div>
+      </div>
+    `;
+  }
+
+  private formatDateLabel(date: string): string {
+    // date is "YYYY-MM-DD" in local time; add labels for today/yesterday.
+    const today = new Date();
+    const todayKey = this.toDateKey(today);
+    const yesterday = new Date(today);
+    yesterday.setDate(today.getDate() - 1);
+    const yesterdayKey = this.toDateKey(yesterday);
+
+    let suffix = '';
+    if (date === todayKey) suffix = ' · Today';
+    else if (date === yesterdayKey) suffix = ' · Yesterday';
+
+    // Parse as local date (avoid UTC shift from `new Date("YYYY-MM-DD")`).
+    const [y, m, d] = date.split('-').map(Number);
+    const parsed = new Date(y, m - 1, d);
+    const pretty = parsed.toLocaleDateString(undefined, {
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+    });
+    return `${pretty}${suffix}`;
+  }
+
+  private toDateKey(d: Date): string {
+    const y = d.getFullYear();
+    const m = (d.getMonth() + 1).toString().padStart(2, '0');
+    const day = d.getDate().toString().padStart(2, '0');
+    return `${y}-${m}-${day}`;
   }
 
 

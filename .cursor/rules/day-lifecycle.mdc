@@ -1,0 +1,50 @@
+---
+description: The day/session lifecycle rules — autostart, midnight rollover, restart-vs-shutdown handling. Read this before touching start_day, end_day, load_and_initialize, or anything that decides which day a session belongs to.
+globs: src-tauri/src/lib.rs
+alwaysApply: false
+---
+
+# Day & Session Lifecycle
+
+The app auto-manages the "work day" around machine power events. These rules are the
+heart of the product — get them wrong and time is credited to the wrong day.
+
+## Dates are LOCAL, and the day_key is fixed for a session
+
+- Use `local_date()` (machine local timezone), never UTC, for `day_key`.
+- A `CurrentSession.day_key` is chosen when the session starts and **never changes while
+  the session runs**. This is deliberate: if the user works past midnight in one
+  continuous session, all of that time is credited to the day the session *started* on.
+  Do NOT re-derive the day_key from the current date mid-session.
+
+## Startup behaviour — `load_and_initialize()`
+
+On every launch (the app autostarts at login via `tauri-plugin-autostart`), decide the
+session from persisted state. All dates compared are local dates.
+
+1. **Fresh boot / brand-new day** (no record for today, no ongoing session): auto-start a
+   new **active** day in the background. The user can open the app and manually pause if
+   they are not working yet.
+2. **Machine restarted the SAME day** the ongoing session belongs to (e.g. power cut):
+   **continue that same day** by appending a new lap — do not start a new day. If the
+   user had *manually* paused before the restart (`user_paused`), restore it paused and do
+   NOT auto-resume.
+3. **Ongoing session belongs to an EARLIER day** (machine was off overnight): finalize/end
+   that previous day (`is_active = false`) and start a fresh active day for today. This is
+   the "shutdown ends the day, tomorrow is a fresh start" case.
+4. **A day the user explicitly ended** (no persisted session, record `is_active = false`):
+   leave it alone, do NOT auto-restart. The user can press Start Day manually.
+
+## Excluding powered-off time — the heartbeat
+
+- `save_state()` writes `last_heartbeat` (unix seconds) on every save (autosave runs every
+  30s plus on lock/sleep/end events).
+- On startup, any lap left **open** (`duration == None`) from the previous run is closed at
+  `last_heartbeat` via `finalize_dangling_lap()`, so the interval the machine was OFF is
+  never counted. Never finalize a dangling lap at "now".
+
+## start_day / end_day
+
+- `start_day` **appends** a lap to today's record if one already exists (user ended earlier
+  and restarted) — never overwrite an existing day's laps.
+- `end_day` finalizes the open lap, sets `is_active = false`, clears the session, and saves.

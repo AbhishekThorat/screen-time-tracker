@@ -1,0 +1,49 @@
+---
+description: High-level overview of the Screen Time Tracker app — what it is, how it is built, and the core data model. Always relevant.
+alwaysApply: true
+---
+
+# Screen Time Tracker — Project Overview
+
+A Tauri 2 desktop application (macOS-first) that automatically tracks active screen
+time using native macOS APIs to detect screen lock/unlock, sleep/wake and
+logout/login events. Time is segmented into **laps** grouped into a **DayRecord**
+per calendar day. All data is stored **locally** on the user's machine.
+
+## Tech stack
+
+- **Backend**: Rust + Tauri 2 (`src-tauri/src/lib.rs` is the core; `main.rs` is the entry point)
+- **Frontend**: Vanilla TypeScript + Vite (`src/main.ts`, `src/styles.css`), no UI framework
+- **Persistence**: JSON file at `~/Library/Application Support/screen-time/state.json`
+- **Key crates**: `serde`/`serde_json`, `chrono`, `tokio`, `cocoa` + `objc` (native macOS),
+  `tauri-plugin-notification`, `tauri-plugin-autostart`
+
+## Core data model (keep these in sync between Rust and TS)
+
+```
+Lap        { start_time: u64, end_time: Option<u64>, duration: Option<u64> }  // unix seconds; None == still open
+DayRecord  { date: "YYYY-MM-DD", total_duration: u64, laps: Vec<Lap>, is_active: bool }
+CurrentSession { day_key, current_lap_start_timestamp, is_paused, user_paused, ... }  // in-memory live state
+AppState   { current_session: Arc<Mutex<Option<CurrentSession>>>, day_records: Arc<Mutex<HashMap<String, DayRecord>>> }
+```
+
+- `day_records` is keyed by local date, so **multiple days of history are retained** and
+  surfaced via the `get_all_day_records` command / History section in the UI.
+- `is_active` on a `DayRecord` means the day has NOT been ended (it may still be paused).
+
+## Build & run
+
+```bash
+yarn tauri dev      # dev with hot reload
+yarn tauri build    # production build
+yarn tsc --noEmit   # typecheck frontend
+cargo check         # (run inside src-tauri) typecheck backend
+```
+
+## Guiding principles
+
+1. Prioritize **accuracy of tracked time** — never count time while the machine is
+   asleep, locked, or powered off.
+2. Respect the user's **manual pause** intent — never auto-resume a user-paused session.
+3. All data stays **local**; there is no server component.
+4. Keep the frontend a thin view over backend state (backend is the source of truth).

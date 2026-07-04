@@ -1,30 +1,37 @@
 # Screen Time Tracker
 
-A simplified Tauri-based desktop application for tracking screen time with automatic pause/resume functionality when the screen is locked/unlocked.
+A Tauri-based desktop application for tracking screen time with automatic pause/resume when the screen is locked/unlocked. It launches automatically at login, manages your work day around machine power events, and keeps a full local history of every day you've tracked.
 
 ## Features
 
 - **Real-time Timer**: Track your daily screen time with a live timer
 - **Automatic Pause/Resume**: Timer automatically pauses when screen is locked and resumes with a new lap when unlocked
-- **Daily Sessions**: Start and end daily tracking sessions
-- **Lap Tracking**: Each screen unlock creates a new lap, providing detailed session breakdown
-- **Today's Laps**: View all laps for the current day with individual durations
-- **Beautiful UI**: Modern, responsive design with real-time updates
+- **Launch at Login**: The app registers itself to start automatically whenever you start your machine
+- **Automatic Day Management**: Your day starts in the background on boot; shutdown ends the day and the next boot starts a fresh one
+- **Resilient to Restarts**: A mid-day restart (e.g. a power cut) continues the same day instead of losing it — time while the machine was off is never counted
+- **Past-midnight aware**: Work that crosses midnight in one continuous session stays credited to the day it started on
+- **Per-day History**: Every tracked day is stored locally with its full lap breakdown and daily total, browsable in the History section
+- **Lap Tracking**: Each screen unlock creates a new lap, providing a detailed session breakdown
+- **Local-first**: All data lives on your machine (`~/Library/Application Support/screen-time/state.json`) — no server, no account
 
 ## How It Works
 
-1. **Start a Day**: Click "Start Day" to begin tracking your screen time
-2. **Automatic Monitoring**: The app runs in the background and monitors screen lock/unlock events
-3. **Lap Creation**: Each time you lock/unlock your screen, a new lap is created
-4. **View Laps**: See all your laps for the current day with individual durations
-5. **End Day**: Click "End Day" to finish tracking and save the session
+1. **Autostart**: The app launches at login and automatically starts your day in the background. If you're not working yet, open it and pause.
+2. **Automatic Monitoring**: It monitors screen lock/unlock and sleep/wake events, pausing and resuming tracking accordingly.
+3. **Lap Creation**: Each time you lock/unlock (or resume), a new lap is created within the current day.
+4. **Day Lifecycle**:
+   - **Shutdown** ends your day; the **next day's boot** starts a fresh day.
+   - A **restart on the same day** (e.g. electricity cut) continues your existing day, adding a new lap.
+   - Working **past midnight** in one sitting keeps the credit on the day you started.
+5. **History**: Browse all past days and their laps in the History section, or click **End Day** to finalize the current day early.
 
 ## Technology Stack
 
 - **Frontend**: TypeScript, HTML5, CSS3
-- **Backend**: Rust with Tauri
+- **Backend**: Rust with Tauri 2
 - **UI Framework**: Vanilla TypeScript with modern CSS
-- **Data Storage**: In-memory storage (can be extended to persistent storage)
+- **Data Storage**: Local JSON persistence (`state.json` in the app data directory), retaining full per-day history
+- **Autostart**: `tauri-plugin-autostart` (launch on login)
 
 ## Development
 
@@ -116,15 +123,17 @@ This approach works on macOS and can be extended for other platforms.
 
 - **Frontend**: Single-page application with real-time updates
 - **Backend**: Rust service with Tauri commands for data management
-- **State Management**: In-memory storage with thread-safe access
-- **Event System**: Tauri events for screen lock/unlock notifications
+- **State Management**: Thread-safe in-memory state (`Arc<Mutex<>>`) persisted to a local JSON file
+- **Event System**: Background monitoring threads for screen lock/unlock and sleep/wake
 
 ## Future Enhancements
 
-- [ ] Persistent data storage (SQLite/JSON files)
+- [x] Persistent data storage (local JSON)
+- [x] Launch at login (autostart)
+- [x] Full per-day history
+- [ ] Migrate storage to SQLite for large histories
 - [ ] Weekly and monthly reports
 - [ ] Export functionality (CSV, PDF reports)
-- [ ] Customizable tracking intervals
 - [ ] Goal setting and notifications
 - [ ] Cross-platform screen lock detection
 - [ ] Settings and preferences
@@ -137,6 +146,15 @@ This approach works on macOS and can be extended for other platforms.
 3. Make your changes
 4. Add tests if applicable
 5. Submit a pull request
+
+## Credits
+
+This project was designed and built with [**Cursor**](https://cursor.com) — the AI-first
+code editor. Cursor's AI pair-programming was used throughout to architect the day/session
+lifecycle, the macOS system-event detection, the local persistence layer, and the
+TypeScript UI. Project conventions for the AI assistant live in [`.cursor/rules/`](.cursor/rules).
+
+🖱️ Built with Cursor.
 
 ## License
 

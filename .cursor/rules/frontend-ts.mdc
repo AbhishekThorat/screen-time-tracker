@@ -1,0 +1,39 @@
+---
+description: Conventions for the TypeScript/Vite frontend — polling, smooth timers, history rendering, and keeping types in sync with the Rust backend.
+globs: src/**/*.ts
+alwaysApply: false
+---
+
+# Frontend (TypeScript) conventions
+
+- Single `ScreenTimeTracker` class in `src/main.ts`; no UI framework, plain DOM.
+- **Keep interfaces in sync with the Rust structs** (`CurrentStatus`, `Lap`, `DayRecord`).
+  If a Rust struct field changes, update the matching TS interface.
+
+## Polling cadence
+
+- Live status/timer: poll `get_current_status` every ~200ms for smooth updates. Keep this
+  path cheap.
+- History: poll `get_all_day_records` slowly (every ~5s) via `startHistoryUpdates()`; also
+  refresh it immediately after actions that change history (e.g. End Day).
+
+## Smooth timer display
+
+- Backend `total_session_duration` = completed laps only. Compute the live current lap on
+  the client from `current_lap_start_timestamp`:
+  `live = floor(Date.now()/1000) - current_lap_start_timestamp; total = total_session_duration + live`.
+- Only run the live counter when `is_active` is true; when paused, show completed total.
+
+## History section
+
+- Rendered from `get_all_day_records` (newest day first). Each day is a collapsible row
+  (`.history-day` toggles `.expanded`) listing its laps with start–end and duration.
+- Parse `"YYYY-MM-DD"` as a **local** date (`new Date(y, m-1, d)`), not `new Date(str)`,
+  which would apply a UTC shift. Label today/yesterday explicitly.
+
+## UX
+
+- Show user actions/errors via `showNotification(msg, 'success' | 'error')`.
+- Button enablement reflects backend state: active → End Day + Start New Lap; paused →
+  can resume or End Day; no session → Start Day only.
+- `async/await` for all `invoke(...)` calls; handle rejections and surface them.

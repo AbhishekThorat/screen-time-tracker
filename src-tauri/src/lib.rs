@@ -64,12 +64,48 @@ struct PersistedSessionState {
     current_lap_start_timestamp: u64,
     accumulated_seconds: u64,
     is_paused: bool,
+    // Whether the pause was initiated by the user (vs. system: lock/sleep/shutdown).
+    // Older state files won't have this field, so default to false on load.
+    #[serde(default)]
+    user_paused: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedState {
     current_session: Option<PersistedSessionState>,
     day_records: HashMap<String, DayRecord>,
+    // Unix timestamp of the last time state was written to disk. Used on the next
+    // launch to bound any lap that was still open when the machine shut down / crashed,
+    // so time while the machine was OFF is never counted. Defaults to 0 for old files.
+    #[serde(default)]
+    last_heartbeat: u64,
+}
+
+// Local calendar date as "YYYY-MM-DD". We use the machine's LOCAL timezone (not UTC)
+// so a "day" matches the user's real day. The day_key is fixed when a session starts
+// and never changes while that session runs — this is what gives late-night work that
+// crosses midnight to the day it started on.
+fn local_date() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+// Close any still-open lap (duration == None) in a day record, ending it at `end_ts`
+// instead of "now". Used on startup to exclude time the machine spent powered off.
+// Recomputes the record's total_duration afterwards.
+fn finalize_dangling_lap(day_record: &mut DayRecord, end_ts: u64) {
+    if let Some(last_lap) = day_record.laps.last_mut() {
+        if last_lap.duration.is_none() {
+            // Guard against a heartbeat that is somehow before the lap start.
+            let end = end_ts.max(last_lap.start_time);
+            last_lap.end_time = Some(end);
+            last_lap.duration = Some(end - last_lap.start_time);
+        }
+    }
+    day_record.total_duration = day_record.laps.iter().filter_map(|lap| lap.duration).sum();
 }
 
 // Get the path to the state file
@@ -90,12 +126,14 @@ fn save_state(app_handle: &AppHandle, state: &AppStateArc) {
             current_lap_start_timestamp: session.current_lap_start_timestamp,
             accumulated_seconds: session.accumulated_seconds,
             is_paused: session.is_paused,
+            user_paused: session.user_paused,
         }
     });
-    
+
     let persisted_state = PersistedState {
         current_session: persisted_session,
         day_records: records_guard.clone(),
+        last_heartbeat: now_unix(),
     };
     
     let state_file = get_state_file_path(app_handle);
@@ -105,45 +143,163 @@ fn save_state(app_handle: &AppHandle, state: &AppStateArc) {
     }
 }
 
-// Load state from disk
-fn load_state(app_handle: &AppHandle, state: &AppStateArc) {
+// Build a brand-new active session + day record for `today`, seeded with one open lap.
+// Used both for a genuinely fresh day and for a new day after an overnight shutdown.
+fn begin_fresh_day(records: &mut HashMap<String, DayRecord>, today: &str) -> CurrentSession {
+    let now = Instant::now();
+    let current_time = now_unix();
+
+    records.insert(today.to_string(), DayRecord {
+        date: today.to_string(),
+        total_duration: 0,
+        laps: vec![Lap {
+            start_time: current_time,
+            end_time: None,
+            duration: None,
+        }],
+        is_active: true,
+    });
+
+    CurrentSession {
+        start_time: now,
+        day_key: today.to_string(),
+        current_lap_start: now,
+        current_lap_start_timestamp: current_time,
+        accumulated_seconds: 0,
+        last_activity_time: now,
+        is_paused: false,
+        user_paused: false,
+    }
+}
+
+// Load persisted state from disk and decide what today's session should be.
+//
+// Rules (all dates are LOCAL dates):
+//   * Fresh boot on a new day, or a day with no record yet -> auto-start a new active
+//     day in the background. The user can manually pause if they aren't working.
+//   * Machine restarted (e.g. power cut) on the SAME day the ongoing session belongs to
+//     -> continue that same day, appending a new lap (unless the user had manually paused,
+//     in which case we respect the pause and don't resume).
+//   * The ongoing session belongs to an EARLIER day (machine was off overnight) -> that
+//     day is finalized/ended, and a fresh active day is started for today.
+//   * A day the user explicitly ended -> left alone; we do NOT auto-restart it.
+//
+// Any lap left open when the app last stopped is closed at `last_heartbeat` so that
+// time while the machine was powered off is never counted.
+fn load_and_initialize(app_handle: &AppHandle, state: &AppStateArc) {
     let state_file = get_state_file_path(app_handle);
-    
-    if let Ok(json) = fs::read_to_string(&state_file) {
-        if let Ok(persisted_state) = serde_json::from_str::<PersistedState>(&json) {
-            // Restore day records
-            let mut records_guard = state.day_records.lock().unwrap();
-            *records_guard = persisted_state.day_records;
-            
-            // Restore session if it exists
-            if let Some(persisted_session) = persisted_state.current_session {
+    let today = local_date();
+
+    let persisted_state = fs::read_to_string(&state_file)
+        .ok()
+        .and_then(|json| serde_json::from_str::<PersistedState>(&json).ok());
+
+    let mut records_guard = state.day_records.lock().unwrap();
+    let mut session_guard = state.current_session.lock().unwrap();
+
+    let Some(persisted_state) = persisted_state else {
+        // No prior state at all -> very first run. Auto-start today in the background.
+        *records_guard = HashMap::new();
+        *session_guard = Some(begin_fresh_day(&mut records_guard, &today));
+        println!("✅ No prior state; auto-started a fresh day for {}", today);
+        drop(session_guard);
+        drop(records_guard);
+        save_state(app_handle, state);
+        return;
+    };
+
+    *records_guard = persisted_state.day_records;
+    // Bound any lap that was still open at shutdown to the last heartbeat we recorded.
+    let heartbeat = if persisted_state.last_heartbeat > 0 {
+        persisted_state.last_heartbeat
+    } else {
+        now_unix()
+    };
+    for record in records_guard.values_mut() {
+        finalize_dangling_lap(record, heartbeat);
+    }
+
+    match persisted_state.current_session {
+        Some(ps) if ps.day_key == today => {
+            // Same day as the ongoing session -> restart mid-day (power cut) or app relaunch.
+            // Make sure the day record exists and is marked active.
+            if let Some(record) = records_guard.get_mut(&today) {
+                record.is_active = true;
+            } else {
+                records_guard.insert(today.clone(), DayRecord {
+                    date: today.clone(),
+                    total_duration: 0,
+                    laps: Vec::new(),
+                    is_active: true,
+                });
+            }
+
+            if ps.user_paused {
+                // User had manually paused before the restart -> respect it, stay paused.
                 let now = Instant::now();
-                let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                
-                // Check if the session is from today
-                let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-                if persisted_session.day_key == today {
-                    let mut session_guard = state.current_session.lock().unwrap();
-                    *session_guard = Some(CurrentSession {
-                        start_time: now,
-                        day_key: persisted_session.day_key.clone(),
-                        current_lap_start: now,
-                        current_lap_start_timestamp: current_time,
-                        accumulated_seconds: persisted_session.accumulated_seconds,
-                        last_activity_time: now,
-                        is_paused: true, // Always start as paused after restart
-                        user_paused: false, // System paused (restart), not user paused
+                *session_guard = Some(CurrentSession {
+                    start_time: now,
+                    day_key: today.clone(),
+                    current_lap_start: now,
+                    current_lap_start_timestamp: now_unix(),
+                    accumulated_seconds: ps.accumulated_seconds,
+                    last_activity_time: now,
+                    is_paused: true,
+                    user_paused: true,
+                });
+                println!("✅ Restored paused session for {} (user paused; not resuming)", today);
+            } else {
+                // Continue the existing day by appending a fresh lap.
+                let now = Instant::now();
+                let current_time = now_unix();
+                if let Some(record) = records_guard.get_mut(&today) {
+                    record.laps.push(Lap {
+                        start_time: current_time,
+                        end_time: None,
+                        duration: None,
                     });
-                    
-                    println!("✅ Session restored from previous state (marked as paused)");
-                } else {
-                    println!("⚠️ Previous session was from a different day, not restoring");
+                }
+                *session_guard = Some(CurrentSession {
+                    start_time: now,
+                    day_key: today.clone(),
+                    current_lap_start: now,
+                    current_lap_start_timestamp: current_time,
+                    accumulated_seconds: 0,
+                    last_activity_time: now,
+                    is_paused: false,
+                    user_paused: false,
+                });
+                println!("✅ Continued ongoing day {} with a new lap (restart detected)", today);
+            }
+        }
+        Some(ps) => {
+            // Ongoing session belongs to an earlier day -> the machine was off overnight.
+            // End that previous day, then start a fresh day for today.
+            if let Some(record) = records_guard.get_mut(&ps.day_key) {
+                record.is_active = false;
+            }
+            *session_guard = Some(begin_fresh_day(&mut records_guard, &today));
+            println!("✅ Ended previous day {} and auto-started a fresh day for {}", ps.day_key, today);
+        }
+        None => {
+            // No ongoing session was persisted (user had ended their day, or clean state).
+            match records_guard.get(&today) {
+                Some(record) if !record.is_active => {
+                    // User already ended today's day -> don't auto-restart it.
+                    println!("ℹ️ Today's day ({}) was already ended; not auto-starting", today);
+                }
+                _ => {
+                    *session_guard = Some(begin_fresh_day(&mut records_guard, &today));
+                    println!("✅ Auto-started a fresh day for {}", today);
                 }
             }
-            
-            println!("✅ State loaded successfully");
         }
     }
+
+    drop(session_guard);
+    drop(records_guard);
+    save_state(app_handle, state);
+    println!("✅ State loaded and initialized successfully");
 }
 
 // Calculate lap duration from start timestamp (excludes sleep/lock time via event handlers)
@@ -163,8 +319,8 @@ fn get_active_lap_start_time(day_record: &DayRecord) -> Option<u64> {
 
 #[tauri::command]
 async fn start_day(state: State<'_, AppStateArc>) -> Result<String, String> {
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    
+    let today = local_date();
+
     let mut session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
     let mut records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
     
@@ -188,21 +344,28 @@ async fn start_day(state: State<'_, AppStateArc>) -> Result<String, String> {
     };
     
     *session_guard = Some(session);
-    
-    // Initialize or update day record with the first lap
-    let day_record = DayRecord {
-        date: today.clone(),
-        total_duration: 0,
-        laps: vec![Lap {
-            start_time: current_time,
-            end_time: None,
-            duration: None,
-        }],
-        is_active: true,
+
+    let new_lap = Lap {
+        start_time: current_time,
+        end_time: None,
+        duration: None,
     };
-    
-    records_guard.insert(today.clone(), day_record);
-    
+
+    // If a record already exists for today (e.g. the user ended their day earlier and is
+    // starting again), APPEND a new lap to it so previous laps are preserved. Otherwise
+    // create a fresh record for the day.
+    if let Some(existing) = records_guard.get_mut(&today) {
+        existing.laps.push(new_lap);
+        existing.is_active = true;
+    } else {
+        records_guard.insert(today.clone(), DayRecord {
+            date: today.clone(),
+            total_duration: 0,
+            laps: vec![new_lap],
+            is_active: true,
+        });
+    }
+
     Ok(format!("Started tracking for {}", today))
 }
 
@@ -402,6 +565,17 @@ async fn get_current_day_laps(state: State<'_, AppStateArc>) -> Result<Vec<Lap>,
     } else {
         Ok(Vec::new())
     }
+}
+
+// Return every stored day record, most recent day first, so the frontend can render
+// the full per-day history (each day with all of its laps and total duration).
+#[tauri::command]
+async fn get_all_day_records(state: State<'_, AppStateArc>) -> Result<Vec<DayRecord>, String> {
+    let records_guard = state.day_records.lock().map_err(|e| e.to_string())?;
+    let mut records: Vec<DayRecord> = records_guard.values().cloned().collect();
+    // Dates are "YYYY-MM-DD" so lexicographic sort == chronological sort.
+    records.sort_by(|a, b| b.date.cmp(&a.date));
+    Ok(records)
 }
 
 #[tauri::command]
@@ -1088,29 +1262,37 @@ fn should_show_startup_notification(state: &AppStateArc) -> Result<bool, String>
     }
     
     let session_guard = state.current_session.lock().map_err(|e| e.to_string())?;
-    
-    // Check if we have a paused session (user had started before but no active lap)
-    if let Some(session) = session_guard.as_ref() {
-        if session.is_paused {
-            // We have a paused session, should notify
-            return Ok(true);
-        }
-    }
-    
-    Ok(false)
+
+    // We now auto-start/continue a day on boot, so notify whenever a session exists
+    // to let the user know tracking is running (and that they can pause if idle).
+    Ok(session_guard.is_some())
 }
 
 // Show startup notification to user
-fn show_startup_notification(app_handle: &AppHandle) {
+fn show_startup_notification(app_handle: &AppHandle, state: &AppStateArc) {
     use tauri_plugin_notification::NotificationExt;
-    
+
     println!("🔔 Showing startup notification to user");
-    
+
+    // Reflect whether we auto-started active tracking or restored a paused session.
+    let is_paused = state
+        .current_session
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| s.is_paused))
+        .unwrap_or(false);
+
+    let body = if is_paused {
+        "Your day is restored but paused. Open the app to resume when you start working."
+    } else {
+        "Tracking started for today. Open the app to pause if you're not working yet."
+    };
+
     let notification = app_handle
         .notification()
         .builder()
         .title("Screen Time Tracker")
-        .body("Welcome back! Would you like to start tracking your screen time today?")
+        .body(body)
         .show();
     
     match notification {
@@ -1127,7 +1309,7 @@ fn check_and_notify_on_startup(app_handle: &AppHandle, state: &AppStateArc) {
     match should_show_startup_notification(state) {
         Ok(should_notify) => {
             if should_notify {
-                show_startup_notification(app_handle);
+                show_startup_notification(app_handle, state);
             } else {
                 println!("ℹ️ No need to show startup notification");
             }
@@ -1173,6 +1355,10 @@ pub fn run() {
     
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(app_state.clone())
         .invoke_handler(tauri::generate_handler![
             start_day,
@@ -1181,6 +1367,7 @@ pub fn run() {
             handle_screen_unlock,
             get_current_status,
             get_current_day_laps,
+            get_all_day_records,
             add_lap,
             stop_lap,
             check_screen_lock_state,
@@ -1193,9 +1380,19 @@ pub fn run() {
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();
-            
-            // Load saved state from disk
-            load_state(&app_handle, &app_state);
+
+            // Ensure the app launches automatically when the user logs into the machine.
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                let autostart_manager = app.autolaunch();
+                match autostart_manager.enable() {
+                    Ok(_) => println!("✅ Autostart enabled (launch on login)"),
+                    Err(e) => eprintln!("❌ Failed to enable autostart: {}", e),
+                }
+            }
+
+            // Load saved state from disk and decide today's session (auto-start / continue / end).
+            load_and_initialize(&app_handle, &app_state);
             
             // Check if we should show startup notification (after system restart)
             let state_for_notification = app_state.clone();

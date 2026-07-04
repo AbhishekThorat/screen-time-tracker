@@ -1,0 +1,50 @@
+---
+description: Conventions for the Rust/Tauri backend — thread safety, time handling, system-event detection, and the Tauri command surface.
+globs: src-tauri/**/*.rs
+alwaysApply: false
+---
+
+# Backend (Rust / Tauri) conventions
+
+## Thread safety
+
+- Shared state is `Arc<Mutex<>>` (`current_session`, `day_records`).
+- **Always drop mutex guards before calling `save_state()`** (or anything that re-locks) —
+  holding a guard across a re-lock deadlocks. Pattern: `drop(session_guard); drop(records_guard); save_state(..)`.
+- Background monitoring threads acquire locks briefly: lock → mutate → unlock quickly.
+
+## Time handling (CRITICAL)
+
+- Persist timestamps as **unix seconds** (`SystemTime` → `now_unix()`), never `Instant`
+  (`Instant` is process-relative and meaningless across restarts).
+- A lap's `duration` is `end_time - start_time`; an open lap has `duration == None`.
+- `total_session_duration` returned to the frontend contains **only completed laps**. The
+  frontend adds the live current-lap time for smooth display — never pre-add it here.
+- On lock/sleep/logout: finalize the current lap. On unlock/wake/login: start a new lap
+  (unless `user_paused`).
+
+## System-event detection (macOS)
+
+Background threads poll every ~500ms with debouncing (require ≥2 consecutive detections):
+
+- Screen lock: native `NSWorkspace.frontmostApplication` check → `pgrep ScreenSaverEngine`
+  → AppleScript fallback (`loginwindow` / `ScreenSaverEngine` frontmost == locked).
+- Sleep/wake: `pmset -g ps`.
+- Respect `user_paused`: system unlock/wake must NOT auto-resume a user-paused session.
+
+## Tauri commands
+
+Session: `start_day`, `end_day`, `get_current_status`
+Laps: `add_lap`, `stop_lap`, `get_current_day_laps`
+History: `get_all_day_records` (all days, newest first)
+System handlers: `handle_screen_lock/unlock`, `handle_system_sleep/wake`, `handle_user_logout/login`
+Notifications: `start_day_from_notification`
+
+When adding a command, register it in the `generate_handler!` macro in `run()`.
+
+## Conventions
+
+- Handle `Result` with `.map_err(|e| e.to_string())?`.
+- Use emoji-prefixed `println!` for notable events (`✅`, `🔒`, `🔓`, `⚠️`) — matches existing logs.
+- New serialized fields on persisted structs must use `#[serde(default)]` so old
+  `state.json` files still load (backward compatibility is required).
