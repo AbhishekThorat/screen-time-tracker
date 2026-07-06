@@ -40,6 +40,8 @@ export class ReportsView {
   private records: DayRecord[] = [];
   private byDate = new Map<string, DayRecord>();
   private tooltip: HTMLDivElement | null = null;
+  private selectedKey: string | null = null; // day whose lap breakdown is shown
+  private eventsInit = false;
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -68,6 +70,28 @@ export class ReportsView {
     const m = (d.getMonth() + 1).toString().padStart(2, "0");
     const day = d.getDate().toString().padStart(2, "0");
     return `${y}-${m}-${day}`;
+  }
+
+  private static parseKey(key: string): Date {
+    const [y, m, d] = key.split("-").map(Number);
+    return new Date(y, m - 1, d);
+  }
+
+  // "Mon, Jul 6" with a Today / Yesterday suffix when applicable.
+  private static dayLabel(key: string): string {
+    const today = ReportsView.keyOf(new Date());
+    const y = new Date();
+    y.setDate(y.getDate() - 1);
+    const yesterday = ReportsView.keyOf(y);
+    let suffix = "";
+    if (key === today) suffix = " · Today";
+    else if (key === yesterday) suffix = " · Yesterday";
+    const pretty = ReportsView.parseKey(key).toLocaleDateString(undefined, {
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+    });
+    return `${pretty}${suffix}`;
   }
 
   private static startOfWeek(d: Date): Date {
@@ -219,15 +243,33 @@ export class ReportsView {
     return `${m}m`;
   }
 
+  // HH:MM:SS — used for individual lap durations in the day-detail panel.
+  private static fmtClock(seconds: number): string {
+    const s = Math.max(0, Math.round(seconds));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`;
+  }
+
   // ---- render ---------------------------------------------------------------
 
   private render(): void {
+    this.initEvents();
+
     const days = this.daysInPeriod();
     const totals = days.map((d) => d.total);
     const total = totals.reduce((a, b) => a + b, 0);
     const trackedDays = totals.filter((t) => t > 0).length;
     const longest = Math.max(0, ...totals);
     const avgPerTracked = trackedDays > 0 ? total / trackedDays : 0;
+
+    // Keep a valid day selected for the detail panel: if the current selection
+    // isn't in this period, default to the most recent day that has data.
+    if (this.selectedKey === null || !days.some((d) => d.key === this.selectedKey)) {
+      const withData = days.filter((d) => d.total > 0);
+      this.selectedKey = withData.length ? withData[withData.length - 1].key : null;
+    }
 
     const hasData = total > 0;
 
@@ -260,9 +302,6 @@ export class ReportsView {
         ${hasData ? this.renderCharts(days) : `<div class="reports-empty">No activity recorded in this period.</div>`}
       </div>
     `;
-
-    this.wireEvents();
-    this.mountTooltip();
   }
 
   private kpiCard(label: string, value: string): string {
@@ -276,35 +315,40 @@ export class ReportsView {
 
   private renderCharts(days: { date: Date; key: string; total: number }[]): string {
     let primary = "";
+    const hint = '<span class="chart-hint">click a bar for details</span>';
     if (this.mode === "week") {
       const bars = days.map((d) => ({
         label: d.date.toLocaleDateString(undefined, { weekday: "short" }),
         value: d.total,
         tip: `${d.date.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" })} · ${ReportsView.fmtDuration(d.total)}`,
-        highlight: d.key === ReportsView.keyOf(new Date()),
+        dayKey: d.key,
       }));
-      primary = this.chartCard("Daily total", this.columnChart(bars));
+      primary = this.chartCard("Daily total", this.columnChart(bars), hint);
     } else if (this.mode === "month") {
       const bars = days.map((d) => ({
         label: `${d.date.getDate()}`,
         value: d.total,
         tip: `${d.date.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })} · ${ReportsView.fmtDuration(d.total)}`,
-        highlight: d.key === ReportsView.keyOf(new Date()),
+        dayKey: d.key,
         sparseLabels: true,
       }));
-      primary = this.chartCard("Daily total", this.columnChart(bars));
+      primary = this.chartCard("Daily total", this.columnChart(bars), hint);
     } else {
-      // Year: monthly totals.
+      // Year: monthly totals. Clicking a month bar drills into that month.
       const monthTotals = new Array(12).fill(0);
       for (const d of days) monthTotals[d.date.getMonth()] += d.total;
       const bars = monthTotals.map((v, i) => ({
         label: MONTH_LABELS[i],
         value: v,
         tip: `${MONTH_LABELS[i]} ${this.anchor.getFullYear()} · ${ReportsView.fmtDuration(v)}`,
-        highlight: this.isCurrentPeriod() && i === new Date().getMonth(),
+        monthIdx: i,
+        emphasize: this.isCurrentPeriod() && i === new Date().getMonth(),
       }));
-      primary = this.chartCard("Monthly total", this.columnChart(bars));
+      primary = this.chartCard("Monthly total", this.columnChart(bars), '<span class="chart-hint">click a month to drill in</span>');
     }
+
+    // Day-detail panel (the drill-down target; replaces the old History list).
+    const detail = this.selectedKey ? this.renderDayDetail(this.selectedKey) : "";
 
     const weekday =
       this.mode === "week"
@@ -319,24 +363,74 @@ export class ReportsView {
 
     const hours = this.chartCard("Active time by hour of day", this.hourHeatmap());
 
-    const calendar = this.mode === "year" ? this.chartCard("Daily activity", this.calendarHeatmap()) : "";
+    const calendar =
+      this.mode === "year"
+        ? this.chartCard("Daily activity", this.calendarHeatmap(), '<span class="chart-hint">click a day for details</span>')
+        : "";
 
-    return primary + weekday + calendar + hours;
+    return primary + detail + weekday + calendar + hours;
   }
 
-  private chartCard(title: string, body: string): string {
+  private chartCard(title: string, body: string, hint = ""): string {
     return `
       <div class="chart-card">
-        <div class="chart-title">${title}</div>
+        <div class="chart-title">${title}${hint}</div>
         ${body}
+      </div>
+    `;
+  }
+
+  // Detail panel for one day: its lap breakdown. This is the drill-down target
+  // that replaced the always-on History list.
+  private renderDayDetail(key: string): string {
+    const rec = this.byDate.get(key);
+    const laps = rec?.laps ?? [];
+    const completed = laps.filter((l) => l.duration != null && l.duration > 0);
+    const total = rec?.total_duration ?? 0;
+    const activeBadge = rec?.is_active ? '<span class="history-badge active">Active</span>' : "";
+
+    const lapsHtml =
+      laps.length === 0
+        ? '<div class="empty-laps">No laps recorded this day</div>'
+        : laps
+            .map((lap, i) => {
+              const start = new Date(lap.start_time * 1000);
+              const end = lap.end_time ? new Date(lap.end_time * 1000) : null;
+              const ongoing = lap.duration == null;
+              const dur = ongoing ? "Ongoing" : ReportsView.fmtClock(lap.duration || 0);
+              return `<div class="history-lap ${ongoing ? "ongoing" : ""}">
+                <span class="history-lap-num">Lap ${i + 1}</span>
+                <span class="history-lap-period">${start.toLocaleTimeString()} - ${end ? end.toLocaleTimeString() : "Ongoing"}</span>
+                <span class="history-lap-duration">${dur}</span>
+              </div>`;
+            })
+            .join("");
+
+    return `
+      <div class="chart-card day-detail">
+        <div class="day-detail-header">
+          <div class="day-detail-title">${ReportsView.dayLabel(key)} ${activeBadge}</div>
+          <div class="day-detail-meta">${ReportsView.fmtDuration(total)} · ${completed.length} lap${completed.length === 1 ? "" : "s"}</div>
+        </div>
+        <div class="day-detail-laps">${lapsHtml}</div>
       </div>
     `;
   }
 
   // Generic vertical column chart as inline SVG. Scales to container width via
   // viewBox; text uses ink tokens, bars use the single blue series hue.
+  // Bars carrying `dayKey` (drill to that day's laps) or `monthIdx` (drill into
+  // that month) become clickable, with a full-height transparent hit target.
   private columnChart(
-    bars: { label: string; value: number; tip: string; highlight?: boolean; sparseLabels?: boolean }[],
+    bars: {
+      label: string;
+      value: number;
+      tip: string;
+      dayKey?: string;
+      monthIdx?: number;
+      emphasize?: boolean;
+      sparseLabels?: boolean;
+    }[],
   ): string {
     const n = bars.length;
     const W = 720;
@@ -370,15 +464,24 @@ export class ReportsView {
 
     const cols = bars
       .map((b, i) => {
-        const cx = padLeft + slot * i + slot / 2;
+        const slotLeft = padLeft + slot * i;
+        const cx = slotLeft + slot / 2;
         const bx = cx - barW / 2;
         const bh = b.value > 0 ? baseY - y(b.value) : 0;
         const by = baseY - bh;
-        const cls = b.highlight ? "viz-bar highlight" : "viz-bar";
+        const clickable = b.dayKey != null || b.monthIdx != null;
+        const strong = (b.dayKey != null && b.dayKey === this.selectedKey) || !!b.emphasize;
+        const cls = `viz-bar${strong ? " selected" : ""}${clickable ? " clickable" : ""}`;
         const bar =
           bh > 0
             ? `<path d="${ReportsView.roundedTopBar(bx, by, barW, bh, 4)}" class="${cls}" data-tip="${ReportsView.esc(b.tip)}" />`
             : `<rect x="${bx.toFixed(1)}" y="${(baseY - 2).toFixed(1)}" width="${barW.toFixed(1)}" height="2" class="viz-bar-empty" data-tip="${ReportsView.esc(b.tip)}" />`;
+
+        // Full-height transparent hit target so the whole column is clickable/hoverable.
+        const drill = b.dayKey != null ? `data-day="${b.dayKey}"` : b.monthIdx != null ? `data-month="${b.monthIdx}"` : "";
+        const hit = clickable
+          ? `<rect class="viz-hit" x="${slotLeft.toFixed(1)}" y="${padTop}" width="${slot.toFixed(1)}" height="${(baseY - padTop).toFixed(1)}" data-tip="${ReportsView.esc(b.tip)}" ${drill} />`
+          : "";
 
         // Selective x labels: all when few, every 5th (day) when many.
         const showLabel = !b.sparseLabels || i === 0 || (i + 1) % 5 === 0 || i === n - 1;
@@ -392,7 +495,7 @@ export class ReportsView {
             ? `<text x="${cx.toFixed(1)}" y="${(by - 6).toFixed(1)}" class="viz-cap" text-anchor="middle">${ReportsView.fmtDuration(b.value)}</text>`
             : "";
 
-        return bar + xlabel + capLabel;
+        return bar + hit + xlabel + capLabel;
       })
       .join("");
 
@@ -477,7 +580,8 @@ export class ReportsView {
             if (!c.inYear) return `<div class="cal-cell empty"></div>`;
             const level = c.total <= 0 ? 0 : Math.min(4, Math.ceil((c.total / max) * 4));
             const tip = `${c.date.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })} · ${ReportsView.fmtDuration(c.total)}`;
-            return `<div class="cal-cell lvl-${level}" data-tip="${ReportsView.esc(tip)}"></div>`;
+            const sel = c.key === this.selectedKey ? " selected" : "";
+            return `<div class="cal-cell lvl-${level} clickable${sel}" data-tip="${ReportsView.esc(tip)}" data-day="${c.key}"></div>`;
           })
           .join("");
         return `<div class="cal-col">${cells}</div>`;
@@ -522,48 +626,65 @@ export class ReportsView {
 
   // ---- events + tooltip -----------------------------------------------------
 
-  private wireEvents(): void {
-    this.root.querySelectorAll<HTMLButtonElement>(".mode-btn").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        this.mode = btn.dataset.mode as Mode;
-        this.anchor = new Date(); // reset to the current period when switching scope
-        this.render();
-      });
-    });
-    this.root.querySelectorAll<HTMLButtonElement>(".nav-btn").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        if (btn.disabled) return;
-        this.shift(Number(btn.dataset.nav));
-      });
-    });
-  }
+  // Attached ONCE to the persistent root. All controls are handled by delegation
+  // so re-rendering (which replaces root.innerHTML) never accumulates listeners.
+  private initEvents(): void {
+    if (this.eventsInit) return;
+    this.eventsInit = true;
 
-  private mountTooltip(): void {
-    let tip = this.root.querySelector<HTMLDivElement>(".viz-tooltip");
-    if (!tip) {
-      tip = document.createElement("div");
-      tip.className = "viz-tooltip";
-      this.root.appendChild(tip);
-    }
+    // Tooltip lives on <body> (position: fixed) so it survives innerHTML swaps.
+    const tip = document.createElement("div");
+    tip.className = "viz-tooltip";
+    document.body.appendChild(tip);
     this.tooltip = tip;
 
-    const rootEl = this.root;
-    const onMove = (e: PointerEvent) => {
-      const target = (e.target as Element)?.closest?.("[data-tip]") as HTMLElement | null;
-      if (!target || !this.tooltip) {
-        if (this.tooltip) this.tooltip.classList.remove("show");
+    this.root.addEventListener("click", (e) => {
+      const t = e.target as Element;
+
+      const modeEl = t.closest<HTMLElement>("[data-mode]");
+      if (modeEl) {
+        this.mode = modeEl.dataset.mode as Mode;
+        this.anchor = new Date(); // reset to the current period when switching scope
+        this.selectedKey = null;
+        this.render();
         return;
       }
-      const text = target.getAttribute("data-tip") || "";
-      this.tooltip.textContent = text;
+
+      const navEl = t.closest<HTMLButtonElement>("[data-nav]");
+      if (navEl) {
+        if (navEl.disabled) return;
+        this.shift(Number(navEl.dataset.nav));
+        return;
+      }
+
+      const monthEl = t.closest<HTMLElement>("[data-month]");
+      if (monthEl) {
+        this.mode = "month";
+        this.anchor = new Date(this.anchor.getFullYear(), Number(monthEl.dataset.month), 1);
+        this.selectedKey = null; // re-defaults to the month's most recent day
+        this.render();
+        return;
+      }
+
+      const dayEl = t.closest<HTMLElement>("[data-day]");
+      if (dayEl) {
+        this.selectedKey = dayEl.dataset.day ?? null;
+        this.render();
+        return;
+      }
+    });
+
+    this.root.addEventListener("pointermove", (e) => {
+      const target = (e.target as Element)?.closest?.("[data-tip]") as HTMLElement | null;
+      if (!target || !this.tooltip) {
+        this.tooltip?.classList.remove("show");
+        return;
+      }
+      this.tooltip.textContent = target.getAttribute("data-tip") || "";
       this.tooltip.classList.add("show");
-      const rect = rootEl.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
-      this.tooltip.style.left = `${x}px`;
-      this.tooltip.style.top = `${y - 12}px`;
-    };
-    rootEl.addEventListener("pointermove", onMove);
-    rootEl.addEventListener("pointerleave", () => this.tooltip?.classList.remove("show"));
+      this.tooltip.style.left = `${(e as PointerEvent).clientX}px`;
+      this.tooltip.style.top = `${(e as PointerEvent).clientY - 12}px`;
+    });
+    this.root.addEventListener("pointerleave", () => this.tooltip?.classList.remove("show"));
   }
 }

@@ -760,10 +760,20 @@ body {
 }
 
 .chart-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
   font-size: 0.95rem;
   font-weight: 700;
   color: #1e293b;
   margin-bottom: 16px;
+}
+
+.chart-hint {
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: #94a3b8;
 }
 
 .reports-empty {
@@ -812,12 +822,23 @@ body {
   transition: fill 0.15s ease;
 }
 
-.viz-bar.highlight {
+.viz-bar.highlight,
+.viz-bar.selected {
   fill: var(--series-1-strong);
 }
 
 .viz-bar:hover {
   fill: var(--series-1-strong);
+}
+
+.viz-bar.clickable {
+  cursor: pointer;
+}
+
+/* Full-column transparent click/hover target overlaid on clickable bars. */
+.viz-hit {
+  fill: transparent;
+  cursor: pointer;
 }
 
 .viz-bar-empty {
@@ -932,9 +953,49 @@ body {
   background: transparent;
 }
 
-/* Shared floating tooltip */
+.cal-cell.clickable {
+  cursor: pointer;
+}
+
+.cal-cell.selected {
+  outline: 2px solid var(--series-1-strong);
+  outline-offset: -1px;
+}
+
+/* Day-detail panel (drill-down target) */
+.day-detail-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.day-detail-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #1e293b;
+}
+
+.day-detail-meta {
+  font-family: "Courier New", monospace;
+  font-weight: 700;
+  color: #059669;
+  font-size: 0.9rem;
+}
+
+.day-detail-laps {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Shared floating tooltip (on <body>, so it survives content re-renders) */
 .viz-tooltip {
-  position: absolute;
+  position: fixed;
   transform: translate(-50%, -100%);
   background: #1e293b;
   color: #fff;
