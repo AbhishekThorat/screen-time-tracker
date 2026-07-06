@@ -1453,7 +1453,15 @@ pub fn run() {
                     .show_menu_on_left_click(false)
                     .on_menu_event(|app, event| match event.id().as_ref() {
                         "open" => open_main_window(app),
-                        "quit" => app.exit(0),
+                        "quit" => {
+                            // The `ExitRequested` handler in `run()` calls `prevent_exit()`
+                            // to keep the app alive when its windows close — but that also
+                            // swallows a normal `app.exit()`, so Quit never actually quit.
+                            // Persist state, then force the process down directly.
+                            let state = app.state::<AppStateArc>();
+                            save_state(app, state.inner());
+                            std::process::exit(0);
+                        }
                         _ => {}
                     })
                     .on_tray_icon_event(|tray, event| {

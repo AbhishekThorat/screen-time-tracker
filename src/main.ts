@@ -86,7 +86,12 @@ class ScreenTimeTracker {
             </div>
           </section>
 
-          <!-- History Section: all recorded days -->
+        </main>
+
+        <div class="main-content" id="view-reports" hidden>
+          <div id="reports-root"></div>
+
+          <!-- History lives on the Reports screen (all recorded days) -->
           <section class="history-section">
             <div class="history-header">
               <h3>📅 History</h3>
@@ -96,10 +101,6 @@ class ScreenTimeTracker {
               <div class="empty-history">No history yet</div>
             </div>
           </section>
-        </main>
-
-        <div class="main-content" id="view-reports" hidden>
-          <div id="reports-root"></div>
         </div>
       </div>
     `;

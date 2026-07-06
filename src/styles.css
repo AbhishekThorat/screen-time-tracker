@@ -610,6 +610,14 @@ body {
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
 }
 
+/* `.main-content { display: flex }` outranks the UA `[hidden]` rule, so a hidden
+   view would otherwise stay visible. Restore hide behaviour with an id+attr
+   selector that wins on specificity. */
+#view-tracker[hidden],
+#view-reports[hidden] {
+  display: none;
+}
+
 /* ===========================================================================
    Reports view
    =========================================================================== */
