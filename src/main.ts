@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { ReportsView } from "./reports";
 
 interface CurrentStatus {
   day_key: string;
@@ -24,6 +25,8 @@ interface DayRecord {
 class ScreenTimeTracker {
   private currentStatus: CurrentStatus | null = null;
   private isTracking = false;
+  private reports: ReportsView | null = null;
+  private activeView: 'tracker' | 'reports' = 'tracker';
 
   constructor() {
     this.initializeUI();
@@ -44,7 +47,12 @@ class ScreenTimeTracker {
           <p class="subtitle">Track your daily screen time with automatic lap management</p>
         </header>
 
-        <main class="main-content">
+        <nav class="view-tabs" role="tablist">
+          <button class="view-tab active" data-view="tracker" role="tab">Tracker</button>
+          <button class="view-tab" data-view="reports" role="tab">Reports</button>
+        </nav>
+
+        <main class="main-content" id="view-tracker">
           <!-- Timer Section -->
           <section class="timer-section">
             <div class="timer-display">
@@ -89,6 +97,10 @@ class ScreenTimeTracker {
             </div>
           </section>
         </main>
+
+        <div class="main-content" id="view-reports" hidden>
+          <div id="reports-root"></div>
+        </div>
       </div>
     `;
   }
@@ -107,6 +119,34 @@ class ScreenTimeTracker {
     testLockBtn?.addEventListener('click', () => this.testLockDetection());
     manualLockBtn?.addEventListener('click', () => this.simulateLock());
     manualUnlockBtn?.addEventListener('click', () => this.simulateUnlock());
+
+    document.querySelectorAll<HTMLButtonElement>('.view-tab').forEach((tab) => {
+      tab.addEventListener('click', () => this.switchView(tab.dataset.view as 'tracker' | 'reports'));
+    });
+  }
+
+  // Toggle between the live Tracker view and the on-demand Reports view. The
+  // Reports view is built lazily the first time it's opened, and re-fetches its
+  // data on every open so the numbers stay fresh.
+  private switchView(view: 'tracker' | 'reports'): void {
+    if (view === this.activeView) return;
+    this.activeView = view;
+
+    document.querySelectorAll<HTMLButtonElement>('.view-tab').forEach((tab) => {
+      tab.classList.toggle('active', tab.dataset.view === view);
+    });
+    const tracker = document.getElementById('view-tracker');
+    const reports = document.getElementById('view-reports');
+    if (tracker) tracker.hidden = view !== 'tracker';
+    if (reports) reports.hidden = view !== 'reports';
+
+    if (view === 'reports') {
+      const root = document.getElementById('reports-root');
+      if (root) {
+        if (!this.reports) this.reports = new ReportsView(root);
+        void this.reports.open();
+      }
+    }
   }
 
   private async startDay(): Promise<void> {

@@ -14,6 +14,7 @@ A lightweight macOS **menu-bar** application for tracking screen time with autom
 - **Resilient to Restarts**: A mid-day restart (e.g. a power cut) continues the same day instead of losing it — time while the machine was off is never counted
 - **Past-midnight aware**: Work that crosses midnight in one continuous session stays credited to the day it started on
 - **Per-day History**: Every tracked day is stored locally with its full lap breakdown and daily total, browsable in the History section
+- **Reports**: A **Reports** tab (loaded on demand) with Week / Month / Year views — KPI cards (total, daily average, days tracked, longest day, current streak), daily/monthly bar charts, average-by-weekday, an active-time-by-hour heatmap, and a GitHub-style yearly calendar. All charts are hand-rolled inline SVG/CSS — no chart library — computed in the frontend from existing per-day data
 - **Lap Tracking**: Each screen unlock creates a new lap, providing a detailed session breakdown
 - **Local-first**: All data lives on your machine (`~/Library/Application Support/screen-time/state.json`) — no server, no account
 
@@ -136,8 +137,8 @@ This approach works on macOS and can be extended for other platforms.
 - [x] Persistent data storage (local JSON)
 - [x] Launch at login (autostart)
 - [x] Full per-day history
+- [x] Weekly, monthly, and yearly reports (in-app Reports tab)
 - [ ] Migrate storage to SQLite for large histories
-- [ ] Weekly and monthly reports
 - [ ] Export functionality (CSV, PDF reports)
 - [ ] Goal setting and notifications
 - [ ] Cross-platform screen lock detection

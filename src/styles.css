@@ -569,3 +569,379 @@ body {
 .history-lap.ongoing .history-lap-duration {
   color: #3b82f6;
 }
+
+/* ===========================================================================
+   View tabs (Tracker | Reports)
+   =========================================================================== */
+.view-tabs {
+  display: flex;
+  gap: 6px;
+  justify-content: center;
+  margin-bottom: 24px;
+  padding: 6px;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 14px;
+  backdrop-filter: blur(10px);
+  width: fit-content;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.view-tab {
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 0.95rem;
+  font-weight: 600;
+  padding: 10px 26px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.18s ease;
+}
+
+.view-tab:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+.view-tab.active {
+  background: #fff;
+  color: #4a3aa7;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+/* ===========================================================================
+   Reports view
+   =========================================================================== */
+.reports-root {
+  /* dataviz palette (light) — swap here to retheme every chart at once */
+  --surface-1: #ffffff;
+  --text-primary: #1e293b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --grid: #e1e0d9;
+  --baseline: #c3c2b7;
+  --series-1: #2a78d6;
+  --series-1-strong: #184f95;
+  /* sequential blue ramp for heatmaps */
+  --seq-0: #eef1f4;
+  --seq-1: #cde2fb;
+  --seq-2: #9ec5f4;
+  --seq-3: #5598e7;
+  --seq-4: #2a78d6;
+
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.reports-controls {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 14px;
+  background: #fff;
+  border-radius: 16px;
+  padding: 14px 18px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+}
+
+.mode-switch {
+  display: flex;
+  gap: 4px;
+  background: #f1f5f9;
+  padding: 4px;
+  border-radius: 10px;
+}
+
+.mode-btn {
+  border: none;
+  background: transparent;
+  color: #64748b;
+  font-weight: 600;
+  font-size: 0.88rem;
+  padding: 7px 18px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.16s ease;
+}
+
+.mode-btn:hover {
+  color: #1e293b;
+}
+
+.mode-btn.active {
+  background: #fff;
+  color: var(--series-1);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+}
+
+.period-nav {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.period-label {
+  font-weight: 600;
+  color: #1e293b;
+  font-size: 0.95rem;
+  min-width: 140px;
+  text-align: center;
+}
+
+.nav-btn {
+  border: 1px solid #e2e8f0;
+  background: #fff;
+  color: #475569;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  font-size: 1.2rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: all 0.16s ease;
+}
+
+.nav-btn:hover:not(:disabled) {
+  background: #f1f5f9;
+  color: #1e293b;
+}
+
+.nav-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* KPI stat cards */
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 14px;
+}
+
+.kpi-card {
+  background: #fff;
+  border-radius: 16px;
+  padding: 20px 22px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+}
+
+.kpi-value {
+  font-size: 1.7rem;
+  font-weight: 700;
+  color: #1e293b;
+  line-height: 1.1;
+}
+
+.kpi-label {
+  margin-top: 6px;
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: #64748b;
+}
+
+/* Chart cards */
+.chart-card {
+  background: #fff;
+  border-radius: 16px;
+  padding: 22px 24px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+}
+
+.chart-title {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #1e293b;
+  margin-bottom: 16px;
+}
+
+.reports-empty {
+  background: #fff;
+  border-radius: 16px;
+  padding: 48px 24px;
+  text-align: center;
+  color: #94a3b8;
+  font-size: 0.95rem;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+}
+
+/* SVG column chart */
+.viz {
+  width: 100%;
+  height: auto;
+  display: block;
+  overflow: visible;
+}
+
+.viz-grid {
+  stroke: var(--grid);
+  stroke-width: 1;
+}
+
+.viz-baseline {
+  stroke: var(--baseline);
+  stroke-width: 1;
+}
+
+.viz-axis {
+  fill: var(--text-muted);
+  font-size: 11px;
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+.viz-cap {
+  fill: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+.viz-bar {
+  fill: var(--series-1);
+  transition: fill 0.15s ease;
+}
+
+.viz-bar.highlight {
+  fill: var(--series-1-strong);
+}
+
+.viz-bar:hover {
+  fill: var(--series-1-strong);
+}
+
+.viz-bar-empty {
+  fill: var(--grid);
+}
+
+/* Hour-of-day heatmap */
+.hour-heatmap {
+  display: grid;
+  grid-template-columns: repeat(24, 1fr);
+  gap: 4px;
+}
+
+.hm-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+}
+
+.hm-cell {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  border-radius: 4px;
+  cursor: default;
+}
+
+.hm-tick {
+  font-size: 9px;
+  color: var(--text-muted);
+  height: 12px;
+}
+
+.hm-legend {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  justify-content: flex-end;
+  margin-top: 12px;
+  font-size: 0.72rem;
+  color: #94a3b8;
+}
+
+.hm-swatch {
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
+}
+
+.lvl-0 { background: var(--seq-0); }
+.lvl-1 { background: var(--seq-1); }
+.lvl-2 { background: var(--seq-2); }
+.lvl-3 { background: var(--seq-3); }
+.lvl-4 { background: var(--seq-4); }
+
+/* Year calendar contribution heatmap */
+.calendar-heatmap {
+  display: flex;
+  gap: 8px;
+}
+
+.cal-weekdays {
+  display: grid;
+  grid-template-rows: repeat(7, 1fr);
+  gap: 3px;
+  padding-top: 20px;
+  font-size: 9px;
+  color: var(--text-muted);
+}
+
+.cal-weekdays > div {
+  height: 13px;
+  line-height: 13px;
+}
+
+.cal-body {
+  flex: 1;
+  overflow-x: auto;
+}
+
+.cal-months {
+  display: flex;
+  height: 16px;
+}
+
+.cal-month {
+  flex: 0 0 16px;
+  font-size: 9px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.cal-grid {
+  display: flex;
+  gap: 3px;
+}
+
+.cal-col {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.cal-cell {
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
+  cursor: default;
+}
+
+.cal-cell.empty {
+  background: transparent;
+}
+
+/* Shared floating tooltip */
+.viz-tooltip {
+  position: absolute;
+  transform: translate(-50%, -100%);
+  background: #1e293b;
+  color: #fff;
+  font-size: 0.78rem;
+  font-weight: 500;
+  padding: 6px 10px;
+  border-radius: 8px;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  z-index: 50;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
+}
+
+.viz-tooltip.show {
+  opacity: 1;
+}
