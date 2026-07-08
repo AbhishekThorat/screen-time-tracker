@@ -888,6 +888,50 @@ body {
   border-radius: 3px;
 }
 
+/* Focus card: lap-length stats above the focused-hours heatmap */
+.focus-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.focus-stat {
+  background: var(--seq-0);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+
+.focus-stat.clickable {
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.focus-stat.clickable:hover {
+  background: var(--seq-1);
+}
+
+.focus-stat-value {
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: #1e293b;
+  line-height: 1.15;
+}
+
+.focus-stat-label {
+  margin-top: 4px;
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: #64748b;
+}
+
+.focus-sub {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #64748b;
+  margin: 2px 0 10px;
+}
+
 .lvl-0 { background: var(--seq-0); }
 .lvl-1 { background: var(--seq-1); }
 .lvl-2 { background: var(--seq-2); }

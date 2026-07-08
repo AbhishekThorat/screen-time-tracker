@@ -27,6 +27,9 @@ interface DayRecord {
 
 type Mode = "week" | "month" | "year";
 
+// A lap must run uninterrupted at least this long to count as "focused" work.
+const FOCUS_MIN_SECONDS = 25 * 60;
+
 const WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const MONTH_LABELS = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -202,8 +205,10 @@ export class ReportsView {
   }
 
   // Active seconds attributed to each hour-of-day (0–23), split across the wall-clock
-  // hours a lap actually spans, for laps that overlap the period.
-  private hourHistogram(): number[] {
+  // hours a lap actually spans, for laps that overlap the period. Passing
+  // `minLapSeconds` restricts the histogram to long uninterrupted laps, which is
+  // what the Focus card uses to find when deep work actually happens.
+  private hourHistogram(minLapSeconds = 0): number[] {
     const buckets = new Array(24).fill(0);
     const { start, end } = this.periodRange();
     const periodStart = start.getTime();
@@ -212,6 +217,7 @@ export class ReportsView {
     for (const rec of this.records) {
       for (const lap of rec.laps) {
         if (lap.duration == null || lap.end_time == null) continue;
+        if (lap.duration < minLapSeconds) continue;
         let s = lap.start_time * 1000;
         let e = lap.end_time * 1000;
         if (e <= periodStart || s >= periodEnd) continue;
@@ -229,6 +235,20 @@ export class ReportsView {
       }
     }
     return buckets.map((v) => Math.round(v));
+  }
+
+  // Completed laps of every tracked day in the period, tagged with their day key
+  // so focus stats can link back to the day-detail panel.
+  private periodLaps(): { lap: Lap; dayKey: string }[] {
+    const out: { lap: Lap; dayKey: string }[] = [];
+    for (const d of this.daysInPeriod()) {
+      const rec = this.byDate.get(d.key);
+      if (!rec) continue;
+      for (const lap of rec.laps) {
+        if (lap.duration != null && lap.duration > 0) out.push({ lap, dayKey: d.key });
+      }
+    }
+    return out;
   }
 
   // ---- formatting -----------------------------------------------------------
@@ -368,7 +388,63 @@ export class ReportsView {
         ? this.chartCard("Daily activity", this.calendarHeatmap(), '<span class="chart-hint">click a day for details</span>')
         : "";
 
-    return primary + detail + weekday + calendar + hours;
+    return primary + detail + weekday + calendar + hours + this.focusCard();
+  }
+
+  // Focus insights: lap-length stats plus a "when does deep work happen" heatmap
+  // that only counts laps of FOCUS_MIN_SECONDS or longer — ten 2-minute fragments
+  // and one 100-minute stretch look identical in raw activity, not here.
+  private focusCard(): string {
+    const laps = this.periodLaps();
+    if (laps.length === 0) return "";
+
+    const total = laps.reduce((a, l) => a + (l.lap.duration || 0), 0);
+    const longest = laps.reduce((best, l) => ((l.lap.duration || 0) > (best.lap.duration || 0) ? l : best), laps[0]);
+    const avg = total / laps.length;
+    const focusedTotal = laps
+      .filter((l) => (l.lap.duration || 0) >= FOCUS_MIN_SECONDS)
+      .reduce((a, l) => a + (l.lap.duration || 0), 0);
+    const share = total > 0 ? Math.round((focusedTotal / total) * 100) : 0;
+
+    const focusedBuckets = this.hourHistogram(FOCUS_MIN_SECONDS);
+    const peak = focusedBuckets.reduce((mi, v, i) => (v > focusedBuckets[mi] ? i : mi), 0);
+    const peakLabel =
+      focusedBuckets[peak] > 0
+        ? `${peak.toString().padStart(2, "0")}:00–${((peak + 1) % 24).toString().padStart(2, "0")}:00`
+        : "—";
+
+    const longestDate = ReportsView.parseKey(longest.dayKey).toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+    });
+
+    const stats = [
+      {
+        value: ReportsView.fmtDuration(longest.lap.duration || 0),
+        label: `Longest lap · ${longestDate}`,
+        dayKey: longest.dayKey,
+      },
+      { value: ReportsView.fmtDuration(avg), label: "Average lap" },
+      { value: `${share}%`, label: "Time in focused laps" },
+      { value: peakLabel, label: "Peak focus hour" },
+    ]
+      .map((s) => {
+        const drill = "dayKey" in s && s.dayKey;
+        return `<div class="focus-stat${drill ? " clickable" : ""}"${drill ? ` data-day="${s.dayKey}"` : ""}>
+          <div class="focus-stat-value">${s.value}</div>
+          <div class="focus-stat-label">${s.label}</div>
+        </div>`;
+      })
+      .join("");
+
+    const mins = Math.round(FOCUS_MIN_SECONDS / 60);
+    return this.chartCard(
+      "Focus",
+      `<div class="focus-stats">${stats}</div>
+       <div class="focus-sub">Focused time by hour of day</div>
+       ${this.hourHeatmap(FOCUS_MIN_SECONDS)}`,
+      `<span class="chart-hint">laps of ${mins}m+ count as focused</span>`,
+    );
   }
 
   private chartCard(title: string, body: string, hint = ""): string {
@@ -507,8 +583,8 @@ export class ReportsView {
   }
 
   // Single row of 24 hour cells, sequential blue ramp by intensity.
-  private hourHeatmap(): string {
-    const buckets = this.hourHistogram();
+  private hourHeatmap(minLapSeconds = 0): string {
+    const buckets = this.hourHistogram(minLapSeconds);
     const max = Math.max(1, ...buckets);
     const cells = buckets
       .map((v, h) => {
