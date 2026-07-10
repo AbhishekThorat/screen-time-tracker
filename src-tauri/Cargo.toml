@@ -30,5 +30,6 @@ chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 objc = "0.2"
 cocoa = "0.25"
+block = "0.1"
 notify = "6"
 

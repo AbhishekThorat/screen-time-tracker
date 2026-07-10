@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{State, AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
@@ -304,7 +305,10 @@ fn load_and_initialize(app_handle: &AppHandle, state: &AppStateArc) {
     println!("✅ State loaded and initialized successfully");
 }
 
-// Calculate lap duration from start timestamp (excludes sleep/lock time via event handlers)
+// Raw wall-clock elapsed since the lap started. Only valid for closing a lap that
+// was awake the whole time (lock, user pause, end-day). Laps interrupted by system
+// sleep must NOT be closed with this — use handle_system_suspend_direct, which
+// bounds the lap to a pre-sleep timestamp instead of "now".
 // Pass in the actual lap start time from records to ensure accuracy
 fn finalize_lap_duration(lap_start_time: u64) -> u64 {
     let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -869,6 +873,53 @@ async fn handle_user_login(state: State<'_, AppStateArc>) -> Result<String, Stri
     }
 }
 
+// If two consecutive iterations of the 1s monitoring loop are separated by more
+// than this many seconds of wall-clock time, the process was suspended in between
+// (system sleep) rather than merely scheduled late.
+const SUSPEND_GAP_THRESHOLD_SECS: u64 = 10;
+
+// Wall-clock timestamp of the last NSWorkspace willSleep notification, 0 once
+// consumed. Lets the monitoring loop resync its lock-state machine even after a
+// sleep too short to trip the gap check above (otherwise a <10s sleep that wakes
+// to an unlocked screen would leave the session paused with nothing to resume it).
+static SLEEP_NOTIFIED_AT: AtomicU64 = AtomicU64::new(0);
+
+// Register for NSWorkspace's willSleep notification so the open lap is closed at
+// the exact moment the machine goes to sleep. The polling thread can't do this:
+// it is frozen during sleep and only learns about it after wake (see the gap
+// detector in start_system_monitoring, which remains as a safety net).
+// No didWake observer is needed — on wake, the monitoring loop's gap detector and
+// lock-state check decide whether to resume immediately (woke unlocked) or wait
+// for the real unlock (woke locked). Resuming blindly on didWake would create a
+// phantom 1-2s lap whenever the Mac wakes to a locked screen.
+#[cfg(target_os = "macos")]
+fn register_sleep_observer(app_handle: AppHandle, state: AppStateArc) {
+    use block::ConcreteBlock;
+    use cocoa::foundation::NSString;
+
+    unsafe {
+        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let center: id = msg_send![workspace, notificationCenter];
+        let name = NSString::alloc(nil).init_str("NSWorkspaceWillSleepNotification");
+
+        let block = ConcreteBlock::new(move |_notification: id| {
+            println!("💤 NSWorkspaceWillSleepNotification - closing open lap before suspend");
+            let now = now_unix();
+            handle_system_suspend_direct(&app_handle, &state, now);
+            SLEEP_NOTIFIED_AT.store(now, Ordering::Relaxed);
+        });
+        // The notification center copies the block, but keep our copy alive too:
+        // the observer is registered once and never removed.
+        let block = block.copy();
+        let block_ptr = &*block as *const _ as *const std::ffi::c_void;
+        let _observer: id = msg_send![center, addObserverForName: name
+                                                          object: nil
+                                                           queue: nil
+                                                      usingBlock: block_ptr];
+        std::mem::forget(block);
+    }
+}
+
 // System monitoring functions
 fn start_system_monitoring(app_handle: AppHandle, state: AppStateArc) {
     let state_clone = state.clone();
@@ -876,11 +927,51 @@ fn start_system_monitoring(app_handle: AppHandle, state: AppStateArc) {
     
     thread::spawn(move || {
         let mut last_screen_lock_state = false;
-        let mut last_sleep_state = false;
         let mut lock_detection_count = 0;
         let mut unlock_detection_count = 0;
-        
+        let mut last_iteration_ts = now_unix();
+
         loop {
+            // Suspend (system sleep) detection. Polling can never observe the sleep
+            // transition itself: macOS freezes this thread along with the process, so
+            // the first thing we see is the wake. What we CAN observe is the aftermath —
+            // wall-clock time jumping far beyond the 1s we slept between iterations.
+            // Treat a large jump as "the process was suspended" and retroactively close
+            // the open lap at the last pre-gap timestamp, so none of the asleep interval
+            // is counted as active time. The NSWorkspaceWillSleepNotification observer
+            // normally closes the lap first (at the exact sleep moment); this is the
+            // safety net for a missed notification.
+            let iteration_ts = now_unix();
+            let gap_detected =
+                iteration_ts.saturating_sub(last_iteration_ts) > SUSPEND_GAP_THRESHOLD_SECS;
+            if gap_detected {
+                println!("💤 Suspend gap detected ({}s) - closing lap at pre-gap timestamp",
+                         iteration_ts - last_iteration_ts);
+                handle_system_suspend_direct(&app_handle_clone, &state_clone, last_iteration_ts);
+            }
+            last_iteration_ts = iteration_ts;
+
+            // Sleeps shorter than the gap threshold don't produce a detectable gap, but
+            // the willSleep observer still closed the lap. Consume its marker once enough
+            // wall clock has passed that the suspend really happened, so short sleeps go
+            // through the same resync below.
+            let sleep_notified_ts = SLEEP_NOTIFIED_AT.load(Ordering::Relaxed);
+            let slept_via_notification =
+                sleep_notified_ts != 0 && iteration_ts >= sleep_notified_ts + 2;
+            if slept_via_notification {
+                SLEEP_NOTIFIED_AT.store(0, Ordering::Relaxed);
+            }
+
+            if gap_detected || slept_via_notification {
+                // Force the lock-state machine to "locked" so the normal unlock path
+                // below starts a fresh lap — whether the Mac woke to a locked screen
+                // (lap resumes at the real unlock) or an already-unlocked one (the
+                // very next check sees "unlocked" and resumes immediately).
+                last_screen_lock_state = true;
+                lock_detection_count = 0;
+                unlock_detection_count = 0;
+            }
+
             // Check screen lock state
             match check_screen_lock_state_sync() {
                 Ok(is_locked) => {
@@ -908,22 +999,7 @@ fn start_system_monitoring(app_handle: AppHandle, state: AppStateArc) {
                 }
                 Err(e) => eprintln!("Error checking screen lock state: {}", e),
             }
-            
-            // Check for system sleep/wake events
-            match check_system_sleep_state() {
-                Ok(is_sleeping) => {
-                    if is_sleeping && !last_sleep_state {
-                        // System just went to sleep - handle directly
-                        handle_system_sleep_direct(&app_handle_clone, &state_clone);
-                    } else if !is_sleeping && last_sleep_state {
-                        // System just woke up - handle directly
-                        handle_system_wake_direct(&app_handle_clone, &state_clone);
-                    }
-                    last_sleep_state = is_sleeping;
-                }
-                Err(e) => eprintln!("Error checking system sleep state: {}", e),
-            }
-            
+
             // Poll once per second. Sub-second lock/sleep latency isn't needed for a time
             // tracker (a ~1s error at a lap boundary is negligible), and 1s halves the
             // subprocess spawns vs. the old 500ms.
@@ -1019,89 +1095,49 @@ fn handle_screen_unlock_direct(app_handle: &AppHandle, state: &AppStateArc) {
     save_state(app_handle, state);
 }
 
-fn handle_system_sleep_direct(app_handle: &AppHandle, state: &AppStateArc) {
+// Close the currently-open lap because the machine is going (or went) to sleep.
+// `end_ts` is when the lap should end: "now" when called from the NSWorkspace
+// willSleep observer (delivered just before the process suspends), or the last
+// pre-gap poll timestamp when called from the monitoring loop's gap detector
+// after wake. It must never be the wake time — ending the lap at wake is exactly
+// what counted a whole night's sleep as one giant active lap.
+fn handle_system_suspend_direct(app_handle: &AppHandle, state: &AppStateArc, end_ts: u64) {
     let mut session_guard = state.current_session.lock().unwrap();
     let mut records_guard = state.day_records.lock().unwrap();
-    
-    if let Some(session) = session_guard.as_mut() {
-        // Skip if already paused (prevent duplicate events)
-        if session.is_paused {
-            return;
-        }
-        
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        
-        // Get actual lap start time from records
-        let lap_start_time = if let Some(day_record) = records_guard.get(&session.day_key) {
-            get_active_lap_start_time(day_record)
-                .unwrap_or(session.current_lap_start_timestamp)
-        } else {
-            session.current_lap_start_timestamp
-        };
-        
-        let lap_duration = finalize_lap_duration(lap_start_time);
-        
-        // End current lap
-        if let Some(day_record) = records_guard.get_mut(&session.day_key) {
-            if let Some(last_lap) = day_record.laps.last_mut() {
-                last_lap.end_time = Some(current_time);
-                last_lap.duration = Some(lap_duration);
-            }
-        }
-        
-        // Mark session as paused by system (not user)
-        session.is_paused = true;
-        session.user_paused = false; // System paused, not user
-    }
-    
-    // Release locks before saving
-    drop(session_guard);
-    drop(records_guard);
-    
-    // Save state
-    save_state(app_handle, state);
-}
 
-fn handle_system_wake_direct(app_handle: &AppHandle, state: &AppStateArc) {
-    let mut session_guard = state.current_session.lock().unwrap();
-    let mut records_guard = state.day_records.lock().unwrap();
-    
+    let mut changed = false;
     if let Some(session) = session_guard.as_mut() {
-        // Skip if already active (prevent duplicate events)
+        // Skip if already paused (locked before sleep, user pause, or the willSleep
+        // observer already closed the lap and this is the gap detector re-firing).
         if !session.is_paused {
-            return;
-        }
-        
-        // Only auto-start if user didn't manually pause
-        if !session.user_paused {
-            let now = Instant::now();
-            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-            
-            // Start new lap
             if let Some(day_record) = records_guard.get_mut(&session.day_key) {
-                day_record.laps.push(Lap {
-                    start_time: current_time,
-                    end_time: None,
-                    duration: None,
-                });
-                
+                if let Some(last_lap) = day_record.laps.last_mut() {
+                    if last_lap.duration.is_none() {
+                        // Guard against an end_ts that is somehow before the lap start.
+                        let end = end_ts.max(last_lap.start_time);
+                        last_lap.end_time = Some(end);
+                        last_lap.duration = Some(end - last_lap.start_time);
+                    }
+                }
+                day_record.total_duration = day_record.laps.iter()
+                    .filter_map(|lap| lap.duration)
+                    .sum();
             }
-            
-            // Reset lap tracking and resume
-            session.current_lap_start = now;
-            session.current_lap_start_timestamp = current_time;
-            session.accumulated_seconds = 0;
-            session.last_activity_time = now;
-            session.is_paused = false; // Resume the session
+
+            // Mark session as paused by system (not user)
+            session.is_paused = true;
+            session.user_paused = false;
+            changed = true;
         }
     }
-    
+
     // Release locks before saving
     drop(session_guard);
     drop(records_guard);
-    
-    // Save state
-    save_state(app_handle, state);
+
+    if changed {
+        save_state(app_handle, state);
+    }
 }
 
 fn check_screen_lock_state_sync() -> Result<bool, String> {
@@ -1160,20 +1196,6 @@ fn check_macos_screen_lock_state() -> Result<bool, String> {
     // on every poll while UNLOCKED (the common case), and an AppleScript spawn each
     // cycle was the single biggest source of idle CPU.
     Ok(false)
-}
-
-fn check_system_sleep_state() -> Result<bool, String> {
-    // Check if system is in sleep mode by looking at power management
-    let output = Command::new("pmset")
-        .arg("-g")
-        .arg("ps")
-        .output()
-        .map_err(|e| e.to_string())?;
-    
-    let output_str = String::from_utf8_lossy(&output.stdout);
-    // If we can get power state info, system is awake
-    // If command fails or returns empty, system might be sleeping
-    Ok(output_str.is_empty() || output_str.contains("sleep"))
 }
 
 // Get system uptime in seconds (macOS)
@@ -1494,10 +1516,16 @@ pub fn run() {
                 check_and_notify_on_startup(&handle_for_notification, &state_for_notification);
             });
             
-            // Start system monitoring when app starts. This single thread handles both
-            // screen lock/unlock and sleep/wake detection (previously a second, redundant
-            // macOS-only lock-detection thread ran in parallel — removed to cut idle CPU).
+            // Start system monitoring when app starts. This single thread handles
+            // screen lock/unlock polling plus suspend-gap detection (previously a second,
+            // redundant macOS-only lock-detection thread ran in parallel — removed to cut
+            // idle CPU, as was a per-second `pmset` sleep check that could never fire).
             start_system_monitoring(app_handle.clone(), app_state.clone());
+
+            // Close the open lap at the exact moment the machine sleeps; the gap
+            // detector inside the monitoring loop is the fallback if this is missed.
+            #[cfg(target_os = "macos")]
+            register_sleep_observer(app_handle.clone(), app_state.clone());
 
             // Start periodic state saving (every 30 seconds)
             let state_for_autosave = app_state.clone();
