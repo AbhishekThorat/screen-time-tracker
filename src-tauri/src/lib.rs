@@ -10,7 +10,7 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
 use cocoa::base::{id, nil};
@@ -118,6 +118,29 @@ fn get_state_file_path(app_handle: &AppHandle) -> PathBuf {
     app_data_dir.join("state.json")
 }
 
+// Last known-good snapshot, rewritten on every successful load. It is the fallback if
+// state.json is ever found corrupt (see load_and_initialize).
+fn get_backup_file_path(app_handle: &AppHandle) -> PathBuf {
+    let app_data_dir = app_handle.path().app_data_dir().unwrap();
+    fs::create_dir_all(&app_data_dir).ok();
+    app_data_dir.join("state.backup.json")
+}
+
+// Read and parse a state file.
+//   None            -> the file does not exist (a genuine first run)
+//   Some(Err(..))   -> the file exists but is unreadable or unparseable (corruption)
+// The distinction matters: a missing file means "start fresh", but a corrupt file must
+// never be treated that way, or we would blank the history and save over the only copy.
+fn read_state_file(path: &Path) -> Option<Result<PersistedState, String>> {
+    if !path.exists() {
+        return None;
+    }
+    match fs::read_to_string(path) {
+        Ok(json) => Some(serde_json::from_str::<PersistedState>(&json).map_err(|e| e.to_string())),
+        Err(e) => Some(Err(e.to_string())),
+    }
+}
+
 // Save state to disk
 fn save_state(app_handle: &AppHandle, state: &AppStateArc) {
     let session_guard = state.current_session.lock().unwrap();
@@ -141,8 +164,18 @@ fn save_state(app_handle: &AppHandle, state: &AppStateArc) {
     
     let state_file = get_state_file_path(app_handle);
     if let Ok(json) = serde_json::to_string_pretty(&persisted_state) {
-        fs::write(state_file, json).ok();
-        println!("✅ State saved successfully");
+        // Write to a sibling temp file, then rename into place. rename(2) within a
+        // filesystem is atomic, so a crash or power cut mid-save can never leave a
+        // half-written state.json behind — the reader either sees the whole old file or
+        // the whole new one. A plain fs::write truncates first, and dying in that window
+        // used to leave a truncated file that the next launch could not parse.
+        let tmp_file = state_file.with_extension("json.tmp");
+        if fs::write(&tmp_file, &json).is_ok() && fs::rename(&tmp_file, &state_file).is_ok() {
+            println!("✅ State saved successfully");
+        } else {
+            eprintln!("❌ Failed to save state to {}", state_file.display());
+            fs::remove_file(&tmp_file).ok();
+        }
     }
 }
 
@@ -191,11 +224,36 @@ fn begin_fresh_day(records: &mut HashMap<String, DayRecord>, today: &str) -> Cur
 // time while the machine was powered off is never counted.
 fn load_and_initialize(app_handle: &AppHandle, state: &AppStateArc) {
     let state_file = get_state_file_path(app_handle);
+    let backup_file = get_backup_file_path(app_handle);
     let today = local_date();
 
-    let persisted_state = fs::read_to_string(&state_file)
-        .ok()
-        .and_then(|json| serde_json::from_str::<PersistedState>(&json).ok());
+    let persisted_state = match read_state_file(&state_file) {
+        Some(Ok(loaded)) => Some(loaded),
+        // The file is genuinely absent -> first ever run.
+        None => None,
+        Some(Err(err)) => {
+            // state.json exists but will not parse. This must NOT fall through to the
+            // "first run" path: that blanks day_records and immediately writes the empty
+            // state back, destroying every day the user ever tracked. Instead, quarantine
+            // the bad file (so it is still there to inspect or hand-recover) and fall back
+            // to the snapshot taken on the last successful load.
+            eprintln!("❌ state.json is corrupt: {}", err);
+            let quarantine = state_file.with_file_name(format!("state.corrupt-{}.json", now_unix()));
+            if fs::rename(&state_file, &quarantine).is_ok() {
+                eprintln!("   Corrupt file preserved at {}", quarantine.display());
+            }
+            match read_state_file(&backup_file) {
+                Some(Ok(recovered)) => {
+                    println!("✅ Recovered history from {}", backup_file.display());
+                    Some(recovered)
+                }
+                _ => {
+                    eprintln!("❌ No usable backup either; starting with empty history");
+                    None
+                }
+            }
+        }
+    };
 
     let mut records_guard = state.day_records.lock().unwrap();
     let mut session_guard = state.current_session.lock().unwrap();
@@ -210,6 +268,12 @@ fn load_and_initialize(app_handle: &AppHandle, state: &AppStateArc) {
         save_state(app_handle, state);
         return;
     };
+
+    // Snapshot the history we just loaded, before this run starts mutating it. If a later
+    // write is ever cut short, this is what the recovery path above restores from.
+    if let Ok(json) = serde_json::to_string_pretty(&persisted_state) {
+        fs::write(&backup_file, json).ok();
+    }
 
     *records_guard = persisted_state.day_records;
     // Bound any lap that was still open at shutdown to the last heartbeat we recorded.
@@ -1421,6 +1485,44 @@ async fn start_day_from_notification(state: State<'_, AppStateArc>) -> Result<St
 }
 
 
+// The autostart plugin writes a LaunchAgent containing only RunAtLoad, which fires solely
+// at login. If the tracker then dies mid-session — crashed, force-quit, or killed because
+// its bundle was replaced by a rebuild — launchd will not bring it back until the *next*
+// login, and a Mac that is only ever slept can go days without one. That is how three days
+// of screen time went unrecorded: the app exited on Jul 11 and nothing restarted it while
+// the machine stayed up for 3+ days.
+//
+// KeepAlive/SuccessfulExit=false makes launchd relaunch the job whenever it exits
+// abnormally (non-zero status or killed by a signal), while still honouring a clean exit:
+// the tray's Quit calls process::exit(0), so quitting on purpose still quits for good.
+//
+// The plist is patched rather than rewritten so the plugin stays the single source of
+// truth for the executable path (which differs between a dev run and the installed .app).
+#[cfg(target_os = "macos")]
+fn ensure_autostart_keepalive() {
+    const KEEP_ALIVE: &str = "\t<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>\n\t</dict>\n";
+
+    let Ok(home) = std::env::var("HOME") else { return };
+    let plist = PathBuf::from(home).join("Library/LaunchAgents/screen-time-tracker.plist");
+
+    let Ok(contents) = fs::read_to_string(&plist) else { return };
+    if contents.contains("KeepAlive") {
+        return;
+    }
+    // Insert into the job dict, i.e. just before the last closing </dict>.
+    let Some(insert_at) = contents.rfind("</dict>") else { return };
+
+    let mut patched = String::with_capacity(contents.len() + KEEP_ALIVE.len());
+    patched.push_str(&contents[..insert_at]);
+    patched.push_str(KEEP_ALIVE);
+    patched.push_str(&contents[insert_at..]);
+
+    match fs::write(&plist, patched) {
+        Ok(_) => println!("✅ Autostart KeepAlive set (relaunch if the app dies)"),
+        Err(e) => eprintln!("❌ Failed to patch autostart plist: {}", e),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = Arc::new(AppState::new());
@@ -1504,6 +1606,10 @@ pub fn run() {
                     Ok(_) => println!("✅ Autostart enabled (launch on login)"),
                     Err(e) => eprintln!("❌ Failed to enable autostart: {}", e),
                 }
+                // enable() rewrites the plist from scratch every launch, so the KeepAlive
+                // patch has to be re-applied after it, not once at install time.
+                #[cfg(target_os = "macos")]
+                ensure_autostart_keepalive();
             }
 
             // Load saved state from disk and decide today's session (auto-start / continue / end).
