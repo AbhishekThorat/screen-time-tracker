@@ -1029,6 +1029,29 @@ body {
   font-weight: 700;
   color: #059669;
   font-size: 0.9rem;
+  /* Keeps the total hard right of the title now that the merge button follows it. */
+  margin-left: auto;
+}
+
+/* Undo for an automatic day rollover. Deliberately quiet: it is a correction for the
+   ambiguous small-hours case, not something to reach for every day. */
+.day-merge {
+  flex-shrink: 0;
+  padding: 5px 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #fff;
+  color: #64748b;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.day-merge:hover {
+  background: #f1f5f9;
+  border-color: #cbd5e1;
+  color: #334155;
 }
 
 .day-detail-laps {

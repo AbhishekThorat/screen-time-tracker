@@ -56,6 +56,28 @@ export class ReportsView {
     this.render();
   }
 
+  // Fold a day's laps back into the day before it, undoing an automatic rollover the
+  // user disagrees with. The merged-away day stops existing, so drill back to the day
+  // that absorbed it rather than leaving a dead selection behind.
+  private async mergeIntoPrevious(day: string): Promise<void> {
+    const previous = this.records
+      .map((r) => r.date)
+      .filter((d) => d < day)
+      .sort()
+      .pop();
+    if (!previous) return;
+
+    try {
+      await invoke("merge_day_into_previous", { date: day });
+    } catch (e) {
+      console.error(`Failed to merge ${day} into the previous day:`, e);
+      return;
+    }
+    await this.loadData();
+    this.selectedKey = previous;
+    this.render();
+  }
+
   private async loadData(): Promise<void> {
     try {
       this.records = await invoke<DayRecord[]>("get_all_day_records");
@@ -482,11 +504,21 @@ export class ReportsView {
             })
             .join("");
 
+    // A day is closed automatically once the date has changed and the user has been away
+    // 6h+ (or it is past the 06:00 cutoff). That call is ambiguous in the small hours —
+    // a long break before an early start looks just like a late night — so offer to fold
+    // this day back into the one before it. Only meaningful if an earlier day exists.
+    const hasEarlier = this.records.some((r) => r.date < key);
+    const mergeBtn = hasEarlier
+      ? `<button class="day-merge" data-merge="${key}" title="Count this day's laps as part of the previous day">Merge into previous day</button>`
+      : "";
+
     return `
       <div class="chart-card day-detail">
         <div class="day-detail-header">
           <div class="day-detail-title">${ReportsView.dayLabel(key)} ${activeBadge}</div>
           <div class="day-detail-meta">${ReportsView.fmtDuration(total)} · ${completed.length} lap${completed.length === 1 ? "" : "s"}</div>
+          ${mergeBtn}
         </div>
         <div class="day-detail-laps">${lapsHtml}</div>
       </div>
@@ -716,6 +748,14 @@ export class ReportsView {
 
     this.root.addEventListener("click", (e) => {
       const t = e.target as Element;
+
+      // Checked before [data-day] so the button doesn't read as a drill-down click.
+      const mergeEl = t.closest<HTMLElement>("[data-merge]");
+      if (mergeEl) {
+        const day = mergeEl.dataset.merge;
+        if (day) void this.mergeIntoPrevious(day);
+        return;
+      }
 
       const modeEl = t.closest<HTMLElement>("[data-mode]");
       if (modeEl) {

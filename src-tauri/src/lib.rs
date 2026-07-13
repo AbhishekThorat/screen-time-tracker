@@ -96,6 +96,200 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
+// A day does not end at midnight. Work that runs from Friday evening into Saturday's
+// small hours is still Friday's work, which is why day_key is stamped when a session
+// starts and never follows the calendar on its own. What ends a day is a real break.
+//
+// So a new day begins only once the calendar date has changed AND either:
+//   * the user has been away for at least IDLE_ROLLOVER_SECS — they stopped for the
+//     night and came back; or
+//   * it is past DAY_CUTOFF_HOUR — the backstop for a session that ran straight through
+//     the night without ever pausing. With no break there is no gap to measure, and
+//     without this the day_key would never roll over at all: that is how a lap at 12:52
+//     on a Saturday afternoon ended up filed under Friday.
+const IDLE_ROLLOVER_SECS: u64 = 6 * 60 * 60;
+const DAY_CUTOFF_HOUR: u32 = 6;
+
+// The rollover decision, kept free of clocks and locks so it can be tested directly.
+// `gap` is the seconds since the user last stopped, and is 0 while a lap is open (they
+// are working right now, so there is nothing to measure).
+fn should_roll_over(date_changed: bool, gap: u64, past_cutoff: bool) -> bool {
+    date_changed && (gap >= IDLE_ROLLOVER_SECS || past_cutoff)
+}
+
+// Where the outgoing day ends and today begins.
+//
+// A session that worked straight through the night is split at the cutoff, so the
+// pre-dawn hours stay with the day they started on and only the morning counts as today.
+// Otherwise the user is coming back from a break and the old day simply ended when they
+// stopped, which is `now` — the lap was already closed back then.
+fn rollover_boundary(working_through: bool, cutoff_ts: u64, now: u64) -> u64 {
+    if working_through {
+        cutoff_ts.min(now)
+    } else {
+        now
+    }
+}
+
+// The record surgery behind merge_day_into_previous, separated from the command so the
+// merge can be tested without a running app. Returns the day that absorbed the laps.
+fn merge_records_into_previous(
+    records: &mut HashMap<String, DayRecord>,
+    date: &str,
+) -> Result<String, String> {
+    // Dates are "YYYY-MM-DD", so the lexicographic max below `date` is the nearest
+    // earlier day that actually has a record (days the machine was off simply don't exist).
+    let target = records
+        .keys()
+        .filter(|k| k.as_str() < date)
+        .max()
+        .cloned()
+        .ok_or_else(|| format!("No earlier day to merge {} into", date))?;
+
+    let source = records
+        .remove(date)
+        .ok_or_else(|| format!("No record for {}", date))?;
+
+    let dest = records
+        .get_mut(&target)
+        .ok_or_else(|| format!("No record for {}", target))?;
+
+    dest.laps.extend(source.laps);
+    dest.laps.sort_by_key(|l| l.start_time);
+    dest.total_duration = dest.laps.iter().filter_map(|l| l.duration).sum();
+    // The absorbing day inherits whether the merged day was still being tracked.
+    dest.is_active = source.is_active;
+
+    Ok(target)
+}
+
+// Today's DAY_CUTOFF_HOUR as a unix timestamp, in local time.
+fn cutoff_timestamp_today() -> u64 {
+    use chrono::Timelike;
+    chrono::Local::now()
+        .with_hour(DAY_CUTOFF_HOUR)
+        .and_then(|t| t.with_minute(0))
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .map(|t| t.timestamp().max(0) as u64)
+        .unwrap_or_else(now_unix)
+}
+
+// Roll the session onto today if the rules above say the previous day is over.
+// Returns (previous_day_key, its final total) when a rollover happened, so the caller
+// can tell the user which day was just closed.
+//
+// Called from the unlock/wake path (the user is back after a break) and from the 30s
+// autosave tick (which is what catches a session that never paused at all).
+fn maybe_roll_over_day(app_handle: &AppHandle, state: &AppStateArc) -> Option<(String, u64)> {
+    let mut session_guard = state.current_session.lock().unwrap();
+    let mut records_guard = state.day_records.lock().unwrap();
+
+    let session = session_guard.as_mut()?;
+    let today = local_date();
+    if session.day_key == today {
+        return None;
+    }
+
+    let now = now_unix();
+    let last_lap = records_guard.get(&session.day_key).and_then(|r| r.laps.last());
+    // An open lap means the user is working right now, so there is no gap to measure.
+    let working_through = last_lap.map(|l| l.duration.is_none()).unwrap_or(false);
+    let gap = if working_through {
+        0
+    } else {
+        last_lap
+            .and_then(|l| l.end_time)
+            .map(|end| now.saturating_sub(end))
+            .unwrap_or(0)
+    };
+
+    let past_cutoff = now >= cutoff_timestamp_today();
+    if !should_roll_over(true, gap, past_cutoff) {
+        // Still the same working day: the date rolled over, but the user is either mid-lap
+        // or back from a short break, and it isn't yet the cutoff. Late-night work stays
+        // with the day it started on.
+        return None;
+    }
+
+    let boundary = rollover_boundary(working_through, cutoff_timestamp_today(), now);
+
+    let previous_day = session.day_key.clone();
+    if let Some(old_record) = records_guard.get_mut(&previous_day) {
+        finalize_dangling_lap(old_record, boundary);
+        old_record.is_active = false;
+    }
+    let previous_total = records_guard
+        .get(&previous_day)
+        .map(|r| r.total_duration)
+        .unwrap_or(0);
+
+    // Open today. If the user worked through the boundary, today's first lap picks up
+    // exactly where the old day's last lap ended, so no time falls into the crack. If the
+    // session is paused (screen locked, machine asleep, or a manual pause), today starts
+    // with no open lap: the unlock/resume path will add one when the user actually
+    // returns, and a manual pause is still honoured across the rollover.
+    let resume_now = !session.is_paused;
+    let laps = if resume_now {
+        vec![Lap { start_time: boundary, end_time: None, duration: None }]
+    } else {
+        Vec::new()
+    };
+
+    records_guard.insert(today.clone(), DayRecord {
+        date: today.clone(),
+        total_duration: 0,
+        laps,
+        is_active: true,
+    });
+
+    session.day_key = today.clone();
+    if resume_now {
+        session.current_lap_start = Instant::now();
+        session.current_lap_start_timestamp = boundary;
+        session.accumulated_seconds = 0;
+    }
+
+    println!("📅 Rolled over {} -> {} (gap {}s, cutoff {})", previous_day, today, gap, past_cutoff);
+
+    drop(session_guard);
+    drop(records_guard);
+    save_state(app_handle, state);
+
+    Some((previous_day, previous_total))
+}
+
+// Tell the user a day was closed behind their back. Deliberately a notification rather
+// than a modal: wake/unlock fires constantly (a lid opened for 30s, a 3am maintenance
+// wake), and a dialog that steals focus the moment you sit down is the wrong tax for a
+// background tracker. The automatic call is right nearly always; when it isn't, the day
+// can be merged back from the Reports view.
+fn notify_day_rolled_over(app_handle: &AppHandle, previous_day: &str, previous_total: u64) {
+    use tauri_plugin_notification::NotificationExt;
+
+    let hours = previous_total / 3600;
+    let minutes = (previous_total % 3600) / 60;
+    let body = format!("{} ended with {}h {}m tracked. Now tracking today.", previous_day, hours, minutes);
+
+    match app_handle
+        .notification()
+        .builder()
+        .title("Started a new day")
+        .body(&body)
+        .show()
+    {
+        Ok(_) => println!("✅ Rollover notification shown"),
+        Err(e) => eprintln!("❌ Failed to show rollover notification: {}", e),
+    }
+}
+
+// Run the rollover check and notify if it fired.
+fn roll_over_day_if_due(app_handle: &AppHandle, state: &AppStateArc) {
+    if let Some((previous_day, previous_total)) = maybe_roll_over_day(app_handle, state) {
+        notify_day_rolled_over(app_handle, &previous_day, previous_total);
+    }
+}
+
 // Close any still-open lap (duration == None) in a day record, ending it at `end_ts`
 // instead of "now". Used on startup to exclude time the machine spent powered off.
 // Recomputes the record's total_duration afterwards.
@@ -216,8 +410,11 @@ fn begin_fresh_day(records: &mut HashMap<String, DayRecord>, today: &str) -> Cur
 //   * Machine restarted (e.g. power cut) on the SAME day the ongoing session belongs to
 //     -> continue that same day, appending a new lap (unless the user had manually paused,
 //     in which case we respect the pause and don't resume).
-//   * The ongoing session belongs to an EARLIER day (machine was off overnight) -> that
-//     day is finalized/ended, and a fresh active day is started for today.
+//   * The ongoing session belongs to an EARLIER day -> apply the same rule the running app
+//     uses (should_roll_over). If the user was away long enough, or it is past the cutoff,
+//     that day is finalized and a fresh one starts for today. If not — the app just
+//     restarted a few minutes after midnight while they were still working — the earlier
+//     day CONTINUES, because late-night work belongs to the day it started on.
 //   * A day the user explicitly ended -> left alone; we do NOT auto-restart it.
 //
 // Any lap left open when the app last stopped is closed at `last_heartbeat` so that
@@ -286,15 +483,30 @@ fn load_and_initialize(app_handle: &AppHandle, state: &AppStateArc) {
         finalize_dangling_lap(record, heartbeat);
     }
 
+    // Whether the ongoing session's day is over, judged by the same rule the running app
+    // uses (see should_roll_over). The app being down is not itself evidence of a new day:
+    // launchd's KeepAlive can relaunch it seconds after a crash, and a plain "the date
+    // changed while we were down" test would split a night owl's session at midnight.
+    // What ends a day is a real break — measured here from the last heartbeat, which is
+    // also where any lap left open was just closed.
+    let downtime = now_unix().saturating_sub(heartbeat);
+    let past_cutoff = now_unix() >= cutoff_timestamp_today();
+
     match persisted_state.current_session {
-        Some(ps) if ps.day_key == today => {
-            // Same day as the ongoing session -> restart mid-day (power cut) or app relaunch.
-            // Make sure the day record exists and is marked active.
-            if let Some(record) = records_guard.get_mut(&today) {
+        Some(ps)
+            if ps.day_key == today
+                || !should_roll_over(true, downtime, past_cutoff) =>
+        {
+            // Continue the ongoing session's day. Either it is still that day (a mid-day
+            // restart or power cut), or the date has changed but the user was working
+            // through it and the app merely restarted — in which case the work still
+            // belongs to the day it started on.
+            let day = ps.day_key.clone();
+            if let Some(record) = records_guard.get_mut(&day) {
                 record.is_active = true;
             } else {
-                records_guard.insert(today.clone(), DayRecord {
-                    date: today.clone(),
+                records_guard.insert(day.clone(), DayRecord {
+                    date: day.clone(),
                     total_duration: 0,
                     laps: Vec::new(),
                     is_active: true,
@@ -306,7 +518,7 @@ fn load_and_initialize(app_handle: &AppHandle, state: &AppStateArc) {
                 let now = Instant::now();
                 *session_guard = Some(CurrentSession {
                     start_time: now,
-                    day_key: today.clone(),
+                    day_key: day.clone(),
                     current_lap_start: now,
                     current_lap_start_timestamp: now_unix(),
                     accumulated_seconds: ps.accumulated_seconds,
@@ -314,12 +526,12 @@ fn load_and_initialize(app_handle: &AppHandle, state: &AppStateArc) {
                     is_paused: true,
                     user_paused: true,
                 });
-                println!("✅ Restored paused session for {} (user paused; not resuming)", today);
+                println!("✅ Restored paused session for {} (user paused; not resuming)", day);
             } else {
                 // Continue the existing day by appending a fresh lap.
                 let now = Instant::now();
                 let current_time = now_unix();
-                if let Some(record) = records_guard.get_mut(&today) {
+                if let Some(record) = records_guard.get_mut(&day) {
                     record.laps.push(Lap {
                         start_time: current_time,
                         end_time: None,
@@ -328,7 +540,7 @@ fn load_and_initialize(app_handle: &AppHandle, state: &AppStateArc) {
                 }
                 *session_guard = Some(CurrentSession {
                     start_time: now,
-                    day_key: today.clone(),
+                    day_key: day.clone(),
                     current_lap_start: now,
                     current_lap_start_timestamp: current_time,
                     accumulated_seconds: 0,
@@ -336,12 +548,16 @@ fn load_and_initialize(app_handle: &AppHandle, state: &AppStateArc) {
                     is_paused: false,
                     user_paused: false,
                 });
-                println!("✅ Continued ongoing day {} with a new lap (restart detected)", today);
+                if day == today {
+                    println!("✅ Continued ongoing day {} with a new lap (restart detected)", day);
+                } else {
+                    println!("✅ Continued {} past midnight (down {}s; not a new day yet)", day, downtime);
+                }
             }
         }
         Some(ps) => {
-            // Ongoing session belongs to an earlier day -> the machine was off overnight.
-            // End that previous day, then start a fresh day for today.
+            // The session's day is genuinely over: the user was away long enough, or it is
+            // past the cutoff. End that day and start a fresh one for today.
             if let Some(record) = records_guard.get_mut(&ps.day_key) {
                 record.is_active = false;
             }
@@ -646,6 +862,42 @@ async fn get_all_day_records(state: State<'_, AppStateArc>) -> Result<Vec<DayRec
     // Dates are "YYYY-MM-DD" so lexicographic sort == chronological sort.
     records.sort_by(|a, b| b.date.cmp(&a.date));
     Ok(records)
+}
+
+// Undo an automatic rollover: fold `date`'s laps back into the day before it. The
+// rollover rules get the call right nearly always, but the 00:00-06:00 window is
+// genuinely ambiguous — a 5h break before an early start reads exactly like a late night —
+// and only the user knows which it was. This is the escape hatch, so the ambiguity costs
+// one click rather than a dialog every morning.
+#[tauri::command]
+async fn merge_day_into_previous(
+    app_handle: AppHandle,
+    state: State<'_, AppStateArc>,
+    date: String,
+) -> Result<String, String> {
+    let state_arc = state.inner().clone();
+    let target = {
+        let mut session_guard = state_arc.current_session.lock().map_err(|e| e.to_string())?;
+        let mut records_guard = state_arc.day_records.lock().map_err(|e| e.to_string())?;
+
+        let target = merge_records_into_previous(&mut records_guard, &date)?;
+
+        // If the day being merged away is the one currently being tracked, the live session
+        // has to follow it, or the next lap would recreate the record we just removed.
+        if let Some(session) = session_guard.as_mut() {
+            if session.day_key == date {
+                session.day_key = target.clone();
+            }
+        }
+
+        drop(session_guard);
+        drop(records_guard);
+        println!("↩️ Merged {} into {}", date, target);
+        target
+    };
+
+    save_state(&app_handle, &state_arc);
+    Ok(format!("Merged {} into {}", date, target))
 }
 
 #[tauri::command]
@@ -1117,9 +1369,15 @@ fn handle_screen_lock_direct(app_handle: &AppHandle, state: &AppStateArc) {
 }
 
 fn handle_screen_unlock_direct(app_handle: &AppHandle, state: &AppStateArc) {
+    // The user is back. If they were away long enough (or it is past the cutoff) and the
+    // date has changed, close out the previous day first — otherwise the lap we are about
+    // to open would be filed under the day they started, which is how Saturday's work
+    // ended up counted as Friday's. This must run before the lap is pushed below.
+    roll_over_day_if_due(app_handle, state);
+
     let mut session_guard = state.current_session.lock().unwrap();
     let mut records_guard = state.day_records.lock().unwrap();
-    
+
     if let Some(session) = session_guard.as_mut() {
         // Skip if already active (prevent duplicate events)
         if !session.is_paused {
@@ -1542,6 +1800,7 @@ pub fn run() {
             get_current_status,
             get_current_day_laps,
             get_all_day_records,
+            merge_day_into_previous,
             add_lap,
             stop_lap,
             check_screen_lock_state,
@@ -1639,6 +1898,11 @@ pub fn run() {
             thread::spawn(move || {
                 loop {
                     thread::sleep(Duration::from_secs(30));
+                    // Catches the day change for a session that never pauses — nobody
+                    // locks the screen or sleeps the Mac, so no unlock event ever fires
+                    // and the cutoff backstop has to be evaluated on a timer. Rolls over
+                    // and saves; otherwise this is just the periodic save.
+                    roll_over_day_if_due(&handle_for_autosave, &state_for_autosave);
                     save_state(&handle_for_autosave, &state_for_autosave);
                 }
             });
@@ -1654,4 +1918,156 @@ pub fn run() {
                 api.prevent_exit();
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOUR: u64 = 3600;
+
+    fn lap(start: u64, end: Option<u64>) -> Lap {
+        Lap { start_time: start, end_time: end, duration: end.map(|e| e - start) }
+    }
+
+    fn day(date: &str, laps: Vec<Lap>) -> DayRecord {
+        let total = laps.iter().filter_map(|l| l.duration).sum();
+        DayRecord { date: date.to_string(), total_duration: total, laps, is_active: false }
+    }
+
+    // --- rollover decision -------------------------------------------------
+    // `gap` is 0 whenever a lap is open, so "working through" is expressed as gap == 0.
+
+    #[test]
+    fn night_owl_past_midnight_stays_on_the_same_day() {
+        // Friday 21:00 -> Saturday 02:00, still typing. The date changed, but there is no
+        // break and it is nowhere near the cutoff. This is the case that must NOT roll.
+        assert!(!should_roll_over(true, 0, false));
+    }
+
+    #[test]
+    fn short_break_after_midnight_stays_on_the_same_day() {
+        // Stepped away for 30 minutes at 01:00. Still Friday's session.
+        assert!(!should_roll_over(true, 30 * 60, false));
+    }
+
+    #[test]
+    fn slept_overnight_starts_a_new_day() {
+        // Machine asleep from Friday 02:00, back at Saturday 10:00: an 8h gap.
+        assert!(should_roll_over(true, 8 * HOUR, true));
+        // ...and it would roll on the gap alone, even before the cutoff hour.
+        assert!(should_roll_over(true, 8 * HOUR, false));
+    }
+
+    #[test]
+    fn six_hour_gap_is_the_boundary() {
+        assert!(!should_roll_over(true, 6 * HOUR - 1, false));
+        assert!(should_roll_over(true, 6 * HOUR, false));
+    }
+
+    #[test]
+    fn cutoff_rolls_over_a_session_that_never_paused() {
+        // Worked straight through the night with no break at all: gap is 0 forever, so
+        // only the cutoff can end the day. Without this the day_key never rolls, which is
+        // how a Saturday afternoon lap got filed under Friday.
+        assert!(should_roll_over(true, 0, true));
+    }
+
+    #[test]
+    fn same_date_never_rolls_over() {
+        // A long idle stretch within one day (a 7h meeting-free afternoon away from the
+        // desk) must not start a second record for the same date.
+        assert!(!should_roll_over(false, 9 * HOUR, false));
+        assert!(!should_roll_over(false, 0, true));
+    }
+
+    // --- where the day is cut ------------------------------------------------
+
+    #[test]
+    fn worked_through_the_night_is_cut_at_the_cutoff_not_at_wake() {
+        // Open lap running since last night; it is now 09:00 and the cutoff was 06:00.
+        // The old day must end at 06:00, so the pre-dawn hours stay with it and only
+        // 06:00->09:00 counts as today. Cutting at `now` would hand today three hours of
+        // last night's work.
+        let cutoff = 6 * HOUR;
+        let now = 9 * HOUR;
+        assert_eq!(rollover_boundary(true, cutoff, now), cutoff);
+    }
+
+    #[test]
+    fn returning_from_a_break_cuts_at_now() {
+        // No open lap: the user stopped last night and just came back. The old day ended
+        // when they stopped, and today starts now.
+        let cutoff = 6 * HOUR;
+        let now = 10 * HOUR;
+        assert_eq!(rollover_boundary(false, cutoff, now), now);
+    }
+
+    #[test]
+    fn boundary_never_runs_ahead_of_the_clock() {
+        // Guards the case where the cutoff has not been reached yet: the boundary must
+        // never be a future timestamp, or a lap would be given a negative duration.
+        let cutoff = 6 * HOUR;
+        let now = 2 * HOUR;
+        assert_eq!(rollover_boundary(true, cutoff, now), now);
+    }
+
+    // --- merge (undo a rollover) -------------------------------------------
+
+    #[test]
+    fn merge_folds_a_day_into_the_previous_one() {
+        let mut records = HashMap::new();
+        records.insert("2026-07-10".into(), day("2026-07-10", vec![lap(100, Some(400))]));
+        records.insert("2026-07-11".into(), day("2026-07-11", vec![lap(500, Some(700))]));
+
+        let target = merge_records_into_previous(&mut records, "2026-07-11").unwrap();
+
+        assert_eq!(target, "2026-07-10");
+        assert!(!records.contains_key("2026-07-11"), "merged day should stop existing");
+        let merged = &records["2026-07-10"];
+        assert_eq!(merged.laps.len(), 2);
+        assert_eq!(merged.total_duration, 300 + 200);
+        // Laps must come back in chronological order, not append order.
+        assert!(merged.laps[0].start_time < merged.laps[1].start_time);
+    }
+
+    #[test]
+    fn merge_skips_over_days_with_no_record() {
+        // The machine was off on the 12th, so the 13th merges into the 11th.
+        let mut records = HashMap::new();
+        records.insert("2026-07-11".into(), day("2026-07-11", vec![lap(100, Some(200))]));
+        records.insert("2026-07-13".into(), day("2026-07-13", vec![lap(900, Some(950))]));
+
+        let target = merge_records_into_previous(&mut records, "2026-07-13").unwrap();
+        assert_eq!(target, "2026-07-11");
+        assert_eq!(records["2026-07-11"].laps.len(), 2);
+    }
+
+    #[test]
+    fn merge_carries_the_open_lap_and_active_flag() {
+        // Merging today (still being tracked) back into yesterday must keep the day alive
+        // and leave the open lap open, or the running session would be orphaned.
+        let mut records = HashMap::new();
+        records.insert("2026-07-13".into(), day("2026-07-13", vec![lap(100, Some(400))]));
+        let mut today = day("2026-07-14", vec![lap(500, None)]);
+        today.is_active = true;
+        records.insert("2026-07-14".into(), today);
+
+        let target = merge_records_into_previous(&mut records, "2026-07-14").unwrap();
+
+        let merged = &records[&target];
+        assert!(merged.is_active, "absorbing day must stay active");
+        assert!(merged.laps.iter().any(|l| l.duration.is_none()), "open lap must survive");
+        // The open lap contributes nothing to the total until it closes.
+        assert_eq!(merged.total_duration, 300);
+    }
+
+    #[test]
+    fn merge_refuses_when_there_is_no_earlier_day() {
+        let mut records = HashMap::new();
+        records.insert("2026-07-04".into(), day("2026-07-04", vec![lap(100, Some(200))]));
+        assert!(merge_records_into_previous(&mut records, "2026-07-04").is_err());
+        // The record must survive a refused merge.
+        assert!(records.contains_key("2026-07-04"));
+    }
 }
