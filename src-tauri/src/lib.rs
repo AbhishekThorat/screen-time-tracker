@@ -82,7 +82,15 @@ struct PersistedState {
     // so time while the machine was OFF is never counted. Defaults to 0 for old files.
     #[serde(default)]
     last_heartbeat: u64,
+    // Which one-off data migrations have already been applied. Absent in files written
+    // before migrations existed, which is exactly the data that needs them -> default 0.
+    #[serde(default)]
+    schema_version: u32,
 }
+
+// Bump when a new one-off migration is added in load_and_initialize.
+//   1 -> re-file laps that a frozen day_key filed under the wrong day.
+const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 // Local calendar date as "YYYY-MM-DD". We use the machine's LOCAL timezone (not UTC)
 // so a "day" matches the user's real day. The day_key is fixed when a session starts
@@ -115,6 +123,82 @@ const DAY_CUTOFF_HOUR: u32 = 6;
 // are working right now, so there is nothing to measure).
 fn should_roll_over(date_changed: bool, gap: u64, past_cutoff: bool) -> bool {
     date_changed && (gap >= IDLE_ROLLOVER_SECS || past_cutoff)
+}
+
+// Local calendar date and local hour of a timestamp, used by the backfill below.
+fn local_date_of(ts: u64) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_opt(ts as i64, 0)
+        .single()
+        .map(|t| t.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+fn local_hour_of(ts: u64) -> u32 {
+    use chrono::{TimeZone, Timelike};
+    chrono::Local
+        .timestamp_opt(ts as i64, 0)
+        .single()
+        .map(|t| t.hour())
+        .unwrap_or(0)
+}
+
+// One-off repair of laps filed under the wrong day, from back when a running app never
+// re-checked the date and a session's day_key stayed frozen for the life of the process.
+//
+// Only laps that started at or after the cutoff are moved. A lap that began at 00:26 on
+// the following calendar date is late-night work and genuinely belongs to the day it
+// started on — moving those would be a second bug, not a fix. What must move is the lap
+// that began the next afternoon and was still being filed under yesterday.
+//
+// Returns the number of laps re-filed.
+fn backfill_misattributed_laps(
+    records: &mut HashMap<String, DayRecord>,
+    session_day: Option<&str>,
+) -> usize {
+    // (destination day, lap) pairs lifted out of the records they were wrongly filed under.
+    let mut moved: Vec<(String, Lap)> = Vec::new();
+
+    for (key, record) in records.iter_mut() {
+        record.laps.retain(|lap| {
+            // An open lap belongs to the live session; leave it where it is.
+            if lap.duration.is_none() {
+                return true;
+            }
+            let actual_day = local_date_of(lap.start_time);
+            if actual_day != *key && local_hour_of(lap.start_time) >= DAY_CUTOFF_HOUR {
+                moved.push((actual_day, lap.clone()));
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    let count = moved.len();
+
+    for (day, lap) in moved {
+        let record = records.entry(day.clone()).or_insert_with(|| DayRecord {
+            date: day.clone(),
+            total_duration: 0,
+            laps: Vec::new(),
+            is_active: false,
+        });
+        record.laps.push(lap);
+    }
+
+    // Re-sort and re-total everything the move touched, then drop any day left with no
+    // laps at all (it only ever existed because of the misfiling).
+    for record in records.values_mut() {
+        record.laps.sort_by_key(|l| l.start_time);
+        record.total_duration = record.laps.iter().filter_map(|l| l.duration).sum();
+    }
+    records.retain(|key, record| {
+        !record.laps.is_empty() || Some(key.as_str()) == session_day
+    });
+
+    count
 }
 
 // Where the outgoing day ends and today begins.
@@ -354,6 +438,7 @@ fn save_state(app_handle: &AppHandle, state: &AppStateArc) {
         current_session: persisted_session,
         day_records: records_guard.clone(),
         last_heartbeat: now_unix(),
+        schema_version: CURRENT_SCHEMA_VERSION,
     };
     
     let state_file = get_state_file_path(app_handle);
@@ -481,6 +566,19 @@ fn load_and_initialize(app_handle: &AppHandle, state: &AppStateArc) {
     };
     for record in records_guard.values_mut() {
         finalize_dangling_lap(record, heartbeat);
+    }
+
+    // One-off repair of history written before the day rolled over on its own. Runs once:
+    // save_state stamps CURRENT_SCHEMA_VERSION, and the pre-migration data is still on
+    // disk in state.backup.json (written just above) if this ever needs undoing.
+    if persisted_state.schema_version < 1 {
+        let session_day = persisted_state.current_session.as_ref().map(|s| s.day_key.as_str());
+        let moved = backfill_misattributed_laps(&mut records_guard, session_day);
+        if moved > 0 {
+            println!("🔧 Re-filed {} lap(s) that were recorded under the wrong day", moved);
+        } else {
+            println!("🔧 History checked: no misfiled laps to re-file");
+        }
     }
 
     // Whether the ongoing session's day is over, judged by the same rule the running app
@@ -2010,6 +2108,107 @@ mod tests {
         let cutoff = 6 * HOUR;
         let now = 2 * HOUR;
         assert_eq!(rollover_boundary(true, cutoff, now), now);
+    }
+
+    // --- backfill of history written before the day rolled over -------------
+
+    // Local wall-clock -> unix, so these tests read as times rather than epoch numbers.
+    fn at(day: u32, hh: u32, mm: u32) -> u64 {
+        use chrono::TimeZone;
+        chrono::Local
+            .with_ymd_and_hms(2026, 7, day, hh, mm, 0)
+            .single()
+            .unwrap()
+            .timestamp() as u64
+    }
+
+    #[test]
+    fn backfill_moves_a_lap_recorded_on_the_wrong_day() {
+        // The real defect: a lap that started at 12:52 the NEXT afternoon, still filed
+        // under the previous day because the running app never re-checked the date.
+        let mut records = HashMap::new();
+        records.insert(
+            "2026-07-10".into(),
+            day("2026-07-10", vec![
+                lap(at(10, 21, 0), Some(at(10, 23, 0))),
+                lap(at(11, 12, 52), Some(at(11, 13, 30))),
+            ]),
+        );
+
+        let moved = backfill_misattributed_laps(&mut records, None);
+
+        assert_eq!(moved, 1);
+        assert_eq!(records["2026-07-10"].laps.len(), 1);
+        assert_eq!(records["2026-07-11"].laps.len(), 1);
+        assert_eq!(records["2026-07-11"].laps[0].start_time, at(11, 12, 52));
+        // Totals must be recomputed on both sides, not just the lap lists.
+        assert_eq!(records["2026-07-10"].total_duration, 2 * 3600);
+        assert_eq!(records["2026-07-11"].total_duration, 38 * 60);
+    }
+
+    #[test]
+    fn backfill_leaves_genuine_late_night_work_alone() {
+        // Worked Friday 21:00 into Saturday 02:23. Those small-hours laps started before
+        // the cutoff, so they belong to Friday — the day they started on. Moving them to
+        // Saturday would be a second bug dressed up as a fix.
+        let mut records = HashMap::new();
+        records.insert(
+            "2026-07-05".into(),
+            day("2026-07-05", vec![
+                lap(at(5, 21, 0), Some(at(5, 23, 30))),
+                lap(at(6, 0, 26), Some(at(6, 2, 23))),
+            ]),
+        );
+
+        let moved = backfill_misattributed_laps(&mut records, None);
+
+        assert_eq!(moved, 0);
+        assert_eq!(records["2026-07-05"].laps.len(), 2);
+        assert!(!records.contains_key("2026-07-06"));
+    }
+
+    #[test]
+    fn backfill_never_touches_the_open_lap() {
+        // The open lap belongs to the live session; re-filing it would orphan the session.
+        let mut records = HashMap::new();
+        let mut today = day("2026-07-14", vec![lap(at(14, 9, 0), None)]);
+        today.is_active = true;
+        records.insert("2026-07-14".into(), today);
+
+        let moved = backfill_misattributed_laps(&mut records, Some("2026-07-14"));
+
+        assert_eq!(moved, 0);
+        assert!(records["2026-07-14"].laps.iter().any(|l| l.duration.is_none()));
+    }
+
+    #[test]
+    fn backfill_drops_a_day_left_empty_but_keeps_the_live_one() {
+        // A record whose only lap was misfiled has no reason to exist afterwards — but the
+        // session's own day must survive even if it is momentarily empty.
+        let mut records = HashMap::new();
+        records.insert("2026-07-10".into(), day("2026-07-10", vec![lap(at(11, 14, 0), Some(at(11, 15, 0)))]));
+        records.insert("2026-07-14".into(), day("2026-07-14", vec![]));
+
+        let moved = backfill_misattributed_laps(&mut records, Some("2026-07-14"));
+
+        assert_eq!(moved, 1);
+        assert!(!records.contains_key("2026-07-10"), "emptied day should be dropped");
+        assert!(records.contains_key("2026-07-11"), "lap should land on the day it happened");
+        assert!(records.contains_key("2026-07-14"), "the live day must survive");
+    }
+
+    #[test]
+    fn backfill_is_idempotent() {
+        // It runs behind a schema_version gate, but a second pass must still be a no-op:
+        // once every lap sits on the day it started, there is nothing left to move.
+        let mut records = HashMap::new();
+        records.insert(
+            "2026-07-10".into(),
+            day("2026-07-10", vec![lap(at(11, 12, 52), Some(at(11, 13, 30)))]),
+        );
+
+        assert_eq!(backfill_misattributed_laps(&mut records, None), 1);
+        assert_eq!(backfill_misattributed_laps(&mut records, None), 0);
     }
 
     // --- merge (undo a rollover) -------------------------------------------
