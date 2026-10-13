@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{State, AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
-use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use std::process::Command;
 use std::thread;
@@ -1812,6 +1811,15 @@ async fn show_main_window(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// Quit from the popover. The `ExitRequested` handler in `run()` calls
+// `prevent_exit()` to keep the app alive when its windows close — but that also
+// swallows a normal `app.exit()`. Persist state, then force the process down directly.
+#[tauri::command]
+fn quit_app(app: AppHandle, state: State<'_, AppStateArc>) {
+    save_state(&app, state.inner());
+    std::process::exit(0);
+}
+
 // Tauri command to start day from notification
 #[tauri::command]
 async fn start_day_from_notification(state: State<'_, AppStateArc>) -> Result<String, String> {
@@ -1850,7 +1858,7 @@ async fn start_day_from_notification(state: State<'_, AppStateArc>) -> Result<St
 //
 // KeepAlive/SuccessfulExit=false makes launchd relaunch the job whenever it exits
 // abnormally (non-zero status or killed by a signal), while still honouring a clean exit:
-// the tray's Quit calls process::exit(0), so quitting on purpose still quits for good.
+// the popover's Quit calls process::exit(0), so quitting on purpose still quits for good.
 //
 // The plist is patched rather than rewritten so the plugin stays the single source of
 // truth for the executable path (which differs between a dev run and the installed .app).
@@ -1908,7 +1916,8 @@ pub fn run() {
             handle_user_logout,
             handle_user_login,
             start_day_from_notification,
-            show_main_window
+            show_main_window,
+            quit_app
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();
@@ -1917,37 +1926,22 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            // Build the menu-bar tray icon. Left click toggles the popover; a right-click
-            // menu provides Open (full window) and Quit.
+            // Build the menu-bar tray icon. Any click toggles the popover, which holds
+            // every control (Expand, Quit). No NSMenu is attached to the status item:
+            // tray-icon relies on an overlay view to intercept left clicks before the
+            // attached menu opens, and macOS 27 opens the menu itself, so the popover
+            // never appeared — the user only saw the Open/Quit menu.
             {
-                let open_item = MenuItemBuilder::with_id("open", "Open Screen Time Tracker").build(app)?;
-                let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
-                let tray_menu = MenuBuilder::new(app).items(&[&open_item, &quit_item]).build()?;
-
                 let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))
                     .expect("failed to load tray icon");
 
                 TrayIconBuilder::with_id("tray")
                     .icon(tray_icon)
                     .tooltip("Screen Time Tracker")
-                    .menu(&tray_menu)
-                    .show_menu_on_left_click(false)
-                    .on_menu_event(|app, event| match event.id().as_ref() {
-                        "open" => open_main_window(app),
-                        "quit" => {
-                            // The `ExitRequested` handler in `run()` calls `prevent_exit()`
-                            // to keep the app alive when its windows close — but that also
-                            // swallows a normal `app.exit()`, so Quit never actually quit.
-                            // Persist state, then force the process down directly.
-                            let state = app.state::<AppStateArc>();
-                            save_state(app, state.inner());
-                            std::process::exit(0);
-                        }
-                        _ => {}
-                    })
                     .on_tray_icon_event(|tray, event| {
                         if let TrayIconEvent::Click { button, button_state, rect, .. } = event {
-                            if button == MouseButton::Left && button_state == MouseButtonState::Up {
+                            let is_click = matches!(button, MouseButton::Left | MouseButton::Right);
+                            if is_click && button_state == MouseButtonState::Up {
                                 toggle_popover(tray.app_handle(), rect);
                             }
                         }
@@ -2011,7 +2005,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|_app_handle, event| {
             // The app is a menu-bar app: keep it running even when all windows are
-            // closed. It only quits via the tray's Quit item (app.exit).
+            // closed. It only quits via the popover's Quit button (quit_app).
             if let RunEvent::ExitRequested { api, .. } = event {
                 api.prevent_exit();
             }

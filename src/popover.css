@@ -105,8 +105,13 @@ body {
   background: white;
 }
 
+.pop-footer {
+  display: flex;
+  gap: 4px;
+}
+
 .pop-expand {
-  width: 100%;
+  flex: 1;
   padding: 8px;
   border: none;
   border-radius: 9px;
@@ -120,4 +125,10 @@ body {
 
 .pop-expand:hover {
   background: rgba(255, 255, 255, 0.15);
+}
+
+.pop-quit {
+  flex: 0 0 auto;
+  padding: 8px 14px;
+  color: rgba(255, 255, 255, 0.7);
 }

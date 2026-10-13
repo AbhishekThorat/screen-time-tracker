@@ -20,19 +20,22 @@ the user opens one.
     Built by `toggle_popover()` on left-click of the tray, positioned under the icon, and
     it **closes itself on blur** (`WindowEvent::Focused(false)`).
   - **`main`** (`index.html` / `src/main.ts`) — the full UI (laps + history). Built by
-    `open_main_window()` from the popover's Expand button or the tray's Open menu item.
+    `open_main_window()` from the popover's Expand button.
 - Closing a window destroys its webview, reclaiming memory. Reopening rebuilds it.
 - Because all windows can be closed, the app must NOT quit when the last one closes:
   `run()` uses `.build().run(|_, event| { if ExitRequested { api.prevent_exit() } })`.
-  The only real quit path is the tray menu's **Quit** item (`app.exit(0)`).
+  The only real quit path is the popover's **Quit** button (`quit_app` command →
+  `save_state` + `process::exit(0)`).
 
 ## Tray
 
 - Built in `setup` with `TrayIconBuilder` (id `"tray"`), icon from `icons/32x32.png`.
-- Left click → `toggle_popover()` (via `on_tray_icon_event`, filtered to
-  `MouseButton::Left` + `MouseButtonState::Up`). `show_menu_on_left_click(false)` so the
-  left click doesn't open the right-click menu.
-- Right-click menu (`on_menu_event`): `open` → `open_main_window`, `quit` → `app.exit(0)`.
+- Left or right click → `toggle_popover()` (via `on_tray_icon_event`, filtered to
+  `MouseButtonState::Up`).
+- **No menu is attached to the tray.** tray-icon sets it as the NSStatusItem's menu and
+  relies on an overlay view to catch left clicks first; on macOS 27 the status item opens
+  the menu itself, so clicks showed Open/Quit instead of the popover. Keep every control
+  (Expand, Quit) in the popover instead of re-adding `.menu(...)`.
 - Requires `tauri = { features = ["tray-icon", "image-png"] }` and both window labels listed
   in `capabilities/default.json` (`"windows": ["main", "popover"]`).
 

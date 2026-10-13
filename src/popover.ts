@@ -9,7 +9,7 @@ interface CurrentStatus {
 }
 
 // Compact menu-bar popover: a quick glance at today's timer plus the essential
-// controls (pause/resume, new lap) and a button to expand the full window.
+// controls (pause/resume, new lap), expand to the full window, and quit.
 class Popover {
   private status: CurrentStatus | null = null;
 
@@ -38,13 +38,17 @@ class Popover {
           <button class="pop-btn pop-btn-primary" id="pop-toggle">Start</button>
           <button class="pop-btn" id="pop-lap">New Lap</button>
         </div>
-        <button class="pop-expand" id="pop-expand">⤢ Expand full window</button>
+        <div class="pop-footer">
+          <button class="pop-expand" id="pop-expand">⤢ Expand full window</button>
+          <button class="pop-expand pop-quit" id="pop-quit">Quit</button>
+        </div>
       </div>
     `;
 
     document.getElementById("pop-toggle")?.addEventListener("click", () => this.toggle());
     document.getElementById("pop-lap")?.addEventListener("click", () => this.newLap());
     document.getElementById("pop-expand")?.addEventListener("click", () => this.expand());
+    document.getElementById("pop-quit")?.addEventListener("click", () => this.quit());
   }
 
   private startPolling(): void {
@@ -125,6 +129,15 @@ class Popover {
       await invoke("show_main_window");
     } catch (e) {
       console.error("expand failed", e);
+    }
+  }
+
+  // The tray has no menu (see lib.rs setup), so the popover is the only Quit path.
+  private async quit(): Promise<void> {
+    try {
+      await invoke("quit_app");
+    } catch (e) {
+      console.error("quit failed", e);
     }
   }
 
